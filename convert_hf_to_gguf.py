@@ -6087,31 +6087,35 @@ class Gemma3nVisionModel(MmprojModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
 
-        # Debug: Log first few tensor names to understand the structure
-        if not hasattr(self, '_debug_tensor_count'):
-            self._debug_tensor_count = 0
-        if self._debug_tensor_count < 10:
-            logger.info(f"DEBUG: Tensor name: {name}")
-            self._debug_tensor_count += 1
-
+        # Gemma3n uses different prefixes than other models:
+        # - model.embed_vision.* for projection layers
+        # - model.vision_tower.* for vision encoder
         # Skip non-vision tensors
-        if not (name.startswith("multi_modal_projector.") or
-                name.startswith("vision_tower.") or
-                name.startswith("multimodal_projector.") or
-                name.startswith("vision_model.")):
+        if not (name.startswith("model.embed_vision.") or
+                name.startswith("model.vision_tower.")):
             return []
+
+        # Strip "model." prefix to match expected llama.cpp format
+        if name.startswith("model."):
+            name = name[6:]  # Remove "model." prefix
 
         # Process MobileNetV5 and projection tensors
         name = name.replace("_weight", ".weight")
 
+        # Rename embed_vision to match our C++ implementation expectations
+        name = name.replace("embed_vision.", "")
+
+        # Rename vision_tower.timm_model to vision_tower for cleaner naming
+        name = name.replace("vision_tower.timm_model.", "vision_tower.")
+
+        # Handle normalization layer naming
+        name = name.replace("hard_embedding_norm", "hard_emb_norm")
+        name = name.replace("soft_embedding_norm", "soft_emb_norm")
+
         # Gemma3n uses Gemma3p5RMSNorm which has scale_shift=0, so no correction needed
         # Unlike Gemma3 which uses Gemma3RMSNorm with scale_shift=1
-        # Only apply correction if explicitly needed based on the norm type
         if "soft_emb_norm.weight" in name:
-            # For Gemma3n, typically no correction needed, but check model version
-            # If the model uses Gemma3RMSNorm style, uncomment below:
-            # logger.info(f"Correcting norm value for '{name}'")
-            # data_torch = data_torch + 1
+            # No correction needed for Gemma3n
             pass
 
         return [(self.map_tensor_name(name), data_torch)]
