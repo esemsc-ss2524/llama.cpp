@@ -6031,6 +6031,10 @@ class Gemma3nVisionModel(MmprojModel):
         # MobileNetV5 hardcodes these values in the architecture definition
         # rather than storing them in config.json
 
+        # Handle empty keys list (n_block_keys) - return 0 for CNN architecture
+        if not keys:
+            return 0
+
         # Check if we're looking for image_size
         if "image_size" in keys:
             # MobileNetV5 300m_enc uses 768x768 input
