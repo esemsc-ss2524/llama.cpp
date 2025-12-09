@@ -6122,19 +6122,18 @@ class Gemma3nVisionModel(MmprojModel):
 
     def map_tensor_name(self, name: str) -> str:
         """Map Gemma3n tensor names to GGUF format"""
-        # Projector tensors (from embed_vision)
-        if name == "embedding.weight":
-            return "v.embedding"
+        # Projector tensors (from embed_vision) - use mm. prefix like Gemma3        if name == "embedding.weight":
+            return "mm.embedding"  # Input embedding
         if name == "embedding_projection.weight":
-            return "v.embedding_projection"
+            return "mm.input_projection"  # Main projection used by C++
         if name == "hard_emb_norm.weight":
-            return "v.hard_emb_norm"
+            return "mm.hard_emb_norm"  # Hard embedding normalization
         if name == "soft_emb_norm.weight":
-            return "v.soft_emb_norm"
+            return "mm.soft_emb_norm"  # Soft embedding normalization (used by C++)
 
-        # Vision tower tensors - add v. prefix for all vision encoder weights
+        # Vision tower tensors - add v.enc. prefix for MobileNetV5 encoder
         if name.startswith("vision_tower."):
-            # Remove vision_tower prefix and add v. prefix
+            # Remove vision_tower prefix and add v.enc. prefix
             tensor_suffix = name[13:]  # Remove "vision_tower."
             return f"v.enc.{tensor_suffix}"
 
@@ -6144,6 +6143,7 @@ class Gemma3nVisionModel(MmprojModel):
         except ValueError:
             # If parent also can't map it, provide a sensible default
             # This shouldn't happen, but provides a fallback
+            logger.warning(f"Using fallback mapping for tensor: {name}")
             return f"v.{name}"
 
 
