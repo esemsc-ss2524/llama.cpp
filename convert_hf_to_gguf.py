@@ -6120,6 +6120,32 @@ class Gemma3nVisionModel(MmprojModel):
 
         return [(self.map_tensor_name(name), data_torch)]
 
+    def map_tensor_name(self, name: str) -> str:
+        """Map Gemma3n tensor names to GGUF format"""
+        # Projector tensors (from embed_vision)
+        if name == "embedding.weight":
+            return "v.embedding"
+        if name == "embedding_projection.weight":
+            return "v.embedding_projection"
+        if name == "hard_emb_norm.weight":
+            return "v.hard_emb_norm"
+        if name == "soft_emb_norm.weight":
+            return "v.soft_emb_norm"
+
+        # Vision tower tensors - add v. prefix for all vision encoder weights
+        if name.startswith("vision_tower."):
+            # Remove vision_tower prefix and add v. prefix
+            tensor_suffix = name[13:]  # Remove "vision_tower."
+            return f"v.enc.{tensor_suffix}"
+
+        # If no match, try parent implementation
+        try:
+            return super().map_tensor_name(name)
+        except ValueError:
+            # If parent also can't map it, provide a sensible default
+            # This shouldn't happen, but provides a fallback
+            return f"v.{name}"
+
 
 @ModelBase.register("Gemma3nForCausalLM")
 class Gemma3NModel(Gemma3Model):
