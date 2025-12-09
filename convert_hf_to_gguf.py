@@ -508,7 +508,11 @@ class ModelBase:
         return ()
 
     def prepare_tensors(self):
-        max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
+        # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
+        if self.tensor_map.mapping:
+            max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
+        else:
+            max_name_len = len("vision_encoder.weight,")  # Default reasonable length
 
         for name, data_torch in chain(self.generate_extra_tensors(), self.get_tensors()):
             # we don't need these
