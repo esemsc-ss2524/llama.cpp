@@ -131,6 +131,7 @@
 
 // mobilenetv5 (gemma3n) definitions
 #define TN_MNV5_STEM_CONV        "v.enc.conv_stem.conv.weight"
+#define TN_MNV5_STEM_BIAS        "v.enc.conv_stem.conv.bias"
 #define TN_MNV5_STEM_BN          "v.enc.conv_stem.bn.weight"
 
 // Stage 0 Block (Edge Residual)
