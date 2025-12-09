@@ -223,29 +223,43 @@ struct clip_hparams {
     }
 };
 
-// MobileNetV5 block structure for Gemma3n vision encoder
+// Expanded MobileNetV5 block structure for Gemma3n vision encoder
 struct mobilenetv5_block {
-    // Universal Inverted Residual block components
-    ggml_tensor * expand_conv_w = nullptr;    // 1x1 expansion convolution
-    ggml_tensor * expand_norm_w = nullptr;    // RMSNorm after expansion
+    // Stage 0 (Edge Residual)
+    ggml_tensor * s0_conv_exp_w = nullptr;
+    ggml_tensor * s0_bn1_w      = nullptr;
+    ggml_tensor * s0_conv_pwl_w = nullptr;
+    ggml_tensor * s0_bn2_w      = nullptr;
 
-    ggml_tensor * dw_conv_w = nullptr;        // Depthwise 3x3 or 5x5 convolution
-    ggml_tensor * dw_norm_w = nullptr;        // RMSNorm after depthwise
+    // Stage 1+ (Universal Inverted Residual)
+    ggml_tensor * dw_start_w    = nullptr;
+    ggml_tensor * dw_start_bn_w = nullptr;
+    
+    ggml_tensor * pw_exp_w      = nullptr;
+    ggml_tensor * pw_exp_bn_w   = nullptr;
 
-    ggml_tensor * se_reduce_w = nullptr;      // Squeeze-Excitation reduction
-    ggml_tensor * se_reduce_b = nullptr;
-    ggml_tensor * se_expand_w = nullptr;      // Squeeze-Excitation expansion
-    ggml_tensor * se_expand_b = nullptr;
+    ggml_tensor * dw_mid_w      = nullptr;
+    ggml_tensor * dw_mid_bn_w   = nullptr;
 
-    ggml_tensor * project_conv_w = nullptr;   // 1x1 projection convolution
-    ggml_tensor * project_norm_w = nullptr;   // RMSNorm after projection
+    ggml_tensor * pw_proj_w     = nullptr;
+    ggml_tensor * pw_proj_bn_w  = nullptr;
 
-    // Multi-Query Attention components (if present)
-    ggml_tensor * mqa_q_w = nullptr;          // Query projection
-    ggml_tensor * mqa_k_w = nullptr;          // Key projection
-    ggml_tensor * mqa_v_w = nullptr;          // Value projection
-    ggml_tensor * mqa_o_w = nullptr;          // Output projection
-    ggml_tensor * mqa_norm_w = nullptr;       // Pre-attention norm
+    ggml_tensor * layer_scale_w = nullptr;
+
+    // Attention (MQA) components
+    ggml_tensor * attn_q_w = nullptr;
+    ggml_tensor * attn_k_w = nullptr;
+    ggml_tensor * attn_v_w = nullptr;
+    ggml_tensor * attn_o_w = nullptr;
+    
+    // Optional downsampling/norm in attention
+    ggml_tensor * attn_k_dw_w   = nullptr;
+    ggml_tensor * attn_k_norm_w = nullptr;
+    ggml_tensor * attn_v_dw_w   = nullptr;
+    ggml_tensor * attn_v_norm_w = nullptr;
+    
+    // Block norm (often present in attention blocks)
+    ggml_tensor * attn_norm_w   = nullptr;
 };
 
 struct clip_layer {
@@ -576,14 +590,53 @@ struct clip_graph {
         gf = ggml_new_graph_custom(ctx0, ctx->max_nodes, false);
     }
 
-    // Helper function for 2D RMSNorm used in MobileNetV5
-    ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight) {
-        // Use ggml_rms_norm which handles the normalization
-        ggml_tensor * normed = ggml_rms_norm(ctx0, inp, eps);
+    // Helper: Normalize over the Channel dimension (dim 2 in [W, H, C, B])
+    // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
+    ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f) {
+        // inp: [W, H, C, B]
+        // Permute to [C, W, H, B]
+        ggml_tensor * cur = ggml_permute(ctx0, inp, 2, 0, 1, 3);
+        cur = ggml_cont(ctx0, cur);
+        
+        // Apply RMS Norm (normalizes first dimension C)
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        
+        // Apply weight (Scale)
         if (weight) {
-            normed = ggml_mul(ctx0, normed, weight);
+            // weight is {C, 1, 1, 1}
+            // cur is {C, W, H, B}
+            // ggml_mul broadcasts 1s in weight to match W, H, B
+            cur = ggml_mul(ctx0, cur, weight);
         }
-        return normed;
+
+        // Permute back to [W, H, C, B]
+        cur = ggml_permute(ctx0, cur, 1, 2, 0, 3);
+        return ggml_cont(ctx0, cur);
+    }
+
+
+    // Helper: Edge Residual Block (Stage 0)
+    // 3x3 Exp Conv -> Norm -> GELU -> 1x1 Pointwise Linear -> Norm -> Residual
+    ggml_tensor * build_edge_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride) {
+        ggml_tensor * cur = inp;
+        
+        // 1. Expansion Conv (3x3)
+        int pad = 1; 
+        cur = ggml_conv_2d(ctx0, block.s0_conv_exp_w, cur, stride, stride, pad, pad, 1, 1);
+        if (block.s0_bn1_w) cur = rms_norm_2d(cur, block.s0_bn1_w);
+        cur = ggml_gelu(ctx0, cur);
+
+        // 2. Pointwise Linear Conv (1x1)
+        cur = ggml_conv_2d(ctx0, block.s0_conv_pwl_w, cur, 1, 1, 0, 0, 1, 1);
+        if (block.s0_bn2_w) cur = rms_norm_2d(cur, block.s0_bn2_w);
+
+        // 3. Residual Connection
+        // Only if stride is 1 and dimensions match
+        if (stride == 1 && inp->ne[2] == cur->ne[2] && inp->ne[0] == cur->ne[0]) {
+            cur = ggml_add(ctx0, cur, inp);
+        }
+        
+        return cur;
     }
 
     // Squeeze-and-Excitation layer
@@ -615,142 +668,223 @@ struct clip_graph {
         return ggml_mul(ctx0, inp, se);
     }
 
-    // Universal Inverted Residual block (main building block of MobileNetV5)
-    ggml_tensor * build_inverted_residual_block(ggml_tensor * inp, const mobilenetv5_block & block,
-                                                  bool has_skip, int stride = 1) {
+    // Helper: Universal Inverted Residual Block (Stage 1+)
+    // DW Start -> Norm -> PW Exp -> Norm -> GELU -> DW Mid -> Norm -> GELU -> PW Proj -> Norm -> Residual
+    ggml_tensor * build_inverted_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride) {
         ggml_tensor * cur = inp;
-        ggml_tensor * residual = inp;
 
-        // Expansion phase (1x1 conv)
-        if (block.expand_conv_w) {
-            cur = ggml_conv_2d_sk_p0(ctx0, block.expand_conv_w, cur);
-            if (block.expand_norm_w) {
-                cur = rms_norm_2d(cur, block.expand_norm_w);
-            }
+        // 1. Depthwise Start (Optional)
+        if (block.dw_start_w) {
+            int k = block.dw_start_w->ne[0];
+            int p = k / 2;
+            cur = ggml_conv_2d_dw(ctx0, block.dw_start_w, cur, stride, stride, p, p, 1, 1);
+            if (block.dw_start_bn_w) cur = rms_norm_2d(cur, block.dw_start_bn_w);
+        }
+
+        // 2. Pointwise Expansion
+        if (block.pw_exp_w) {
+            cur = ggml_conv_2d(ctx0, block.pw_exp_w, cur, 1, 1, 0, 0, 1, 1);
+            if (block.pw_exp_bn_w) cur = rms_norm_2d(cur, block.pw_exp_bn_w);
             cur = ggml_gelu(ctx0, cur);
         }
 
-        // Depthwise convolution (3x3 or 5x5)
-        if (block.dw_conv_w) {
-            // Depthwise conv with padding
-            int kernel_size = block.dw_conv_w->ne[0];
-            int padding = kernel_size / 2;
-            cur = ggml_conv_2d_dw(ctx0, block.dw_conv_w, cur, stride, stride, padding, padding, 1, 1);
-            if (block.dw_norm_w) {
-                cur = rms_norm_2d(cur, block.dw_norm_w);
-            }
+        // 3. Depthwise Mid (Optional)
+        if (block.dw_mid_w) {
+            int k = block.dw_mid_w->ne[0];
+            int p = k / 2;
+            cur = ggml_conv_2d_dw(ctx0, block.dw_mid_w, cur, 1, 1, p, p, 1, 1);
+            if (block.dw_mid_bn_w) cur = rms_norm_2d(cur, block.dw_mid_bn_w);
             cur = ggml_gelu(ctx0, cur);
         }
 
-        // Squeeze-and-Excitation
-        cur = build_se_layer(cur, block.se_reduce_w, block.se_reduce_b,
-                            block.se_expand_w, block.se_expand_b);
-
-        // Projection phase (1x1 conv)
-        if (block.project_conv_w) {
-            cur = ggml_conv_2d_sk_p0(ctx0, block.project_conv_w, cur);
-            if (block.project_norm_w) {
-                cur = rms_norm_2d(cur, block.project_norm_w);
-            }
+        // 4. Pointwise Projection
+        if (block.pw_proj_w) {
+            cur = ggml_conv_2d(ctx0, block.pw_proj_w, cur, 1, 1, 0, 0, 1, 1);
+            if (block.pw_proj_bn_w) cur = rms_norm_2d(cur, block.pw_proj_bn_w);
         }
 
-        // Skip connection (only if stride=1 and same spatial dimensions)
-        if (has_skip && stride == 1) {
-            cur = ggml_add(ctx0, cur, residual);
+        // 5. Residual Connection
+        bool same_spatial = (inp->ne[0] == cur->ne[0]) && (inp->ne[1] == cur->ne[1]);
+        bool same_channel = (inp->ne[2] == cur->ne[2]);
+        
+        if (same_spatial && same_channel) {
+            // Apply Layer Scale if present
+            if (block.layer_scale_w) {
+                // Apply channel-wise scaling
+                // Permute to [C, W, H, B] -> mul -> Permute back
+                ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
+                scaled = ggml_mul(ctx0, scaled, block.layer_scale_w);
+                cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
+            }
+            cur = ggml_add(ctx0, cur, inp);
         }
 
         return cur;
     }
 
-    // MobileNetV5 encoder with Multi-Scale Fusion Adapter
-    ggml_cgraph * build_mobilenetv5() {
-        // Raw image input
-        ggml_tensor * inp = build_inp();
+    // Helper: MobileNet Multi-Query Attention (MQA)
+    ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block) {
+        ggml_tensor * cur = inp;
+        
+        if (block.attn_norm_w) cur = rms_norm_2d(cur, block.attn_norm_w);
 
-        // Stem: Conv3x3, stride 2
-        ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
-        if (model.mobilenet_stem_norm_w) {
-            cur = rms_norm_2d(cur, model.mobilenet_stem_norm_w);
+        // Q [W, H, C, B] -> [W, H, D*Hds, B]
+        ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
+        
+        // K Downsampling & Conv
+        ggml_tensor * k_inp = cur;
+        if (block.attn_k_dw_w) {
+            int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
+            k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
+            if (block.attn_k_norm_w) k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
         }
+        ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
+
+        // V Downsampling & Conv
+        ggml_tensor * v_inp = cur;
+        if (block.attn_v_dw_w) {
+            int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
+            v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
+            if (block.attn_v_norm_w) v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+        }
+        ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
+
+        // Reshape for attention
+        const int W = cur->ne[0]; const int H = cur->ne[1]; const int B = cur->ne[3];
+        const int D = k->ne[2]; // Head Dim
+        const int n_head = q->ne[2] / D;
+        
+        q = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, q, D*n_head, W*H, B), D, n_head, W*H, B), 0, 2, 1, 3);
+        q = ggml_cont(ctx0, q); // [D, N, n_head, B]
+
+        const int Wk = k->ne[0]; const int Hk = k->ne[1];
+        k = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, k, D, Wk*Hk, B), D, 1, Wk*Hk, B), 0, 2, 1, 3);
+        k = ggml_cont(ctx0, k); // [D, M, 1, B]
+
+        v = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, v, D, Wk*Hk, B), D, 1, Wk*Hk, B), 0, 2, 1, 3);
+        v = ggml_cont(ctx0, v); // [D, M, 1, B]
+
+        float scale = 1.0f / sqrtf((float)D);
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q); // [M, N]
+        kq = ggml_soft_max_ext(ctx0, kq, nullptr, scale, 0.0f);
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq); // [D, N]
+
+        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3); // [D, n_head, N, B]
+        kqv = ggml_reshape_4d(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ggml_cont(ctx0, kqv), D*n_head, W*H, B), 1, 0, 2, 3), W, H, D*n_head, B);
+
+        cur = ggml_conv_2d(ctx0, block.attn_o_w, kqv, 1, 1, 0, 0, 1, 1);
+
+        if (inp->ne[0] == cur->ne[0] && inp->ne[2] == cur->ne[2]) {
+            cur = ggml_add(ctx0, cur, inp);
+        }
+        return cur;
+    }
+
+    // ------------------------------------------------------------------------
+    // MobileNetV5 Builder (Gemma 3n)
+    // ------------------------------------------------------------------------
+    ggml_cgraph * build_mobilenetv5() {
+        // Use raw image input (already normalized), no patch conv
+        ggml_tensor * inp = build_inp_raw(); 
+
+        // 1. Stem
+        ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
+        if (model.mobilenet_stem_norm_w) cur = rms_norm_2d(cur, model.mobilenet_stem_norm_w);
         cur = ggml_gelu(ctx0, cur);
 
-        // Process through MobileNetV5 blocks
-        // Store intermediate features for MSFA
         std::vector<ggml_tensor*> intermediate_features;
         const int total_blocks = model.mobilenet_blocks.size();
 
         for (int i = 0; i < total_blocks; i++) {
             const auto & block = model.mobilenet_blocks[i];
+            
+            // Heuristic to detect stride 2 blocks (Start of stages)
+            // Indices based on MobileNetV5-300m config
+            int stride = 1;
+            if (i == 0 || i == 3 || i == 8 || i == 35) stride = 2;
 
-            // Determine if this block has a skip connection
-            // This is a simplification; actual logic depends on stride and channels
-            bool has_skip = (i > 0);  // Skip for all blocks except first
-            int stride = 1;  // Most blocks have stride 1, some have stride 2
+            if (block.s0_conv_exp_w) {
+                cur = build_edge_residual(cur, block, stride);
+            } 
+            else if (block.attn_q_w) {
+                cur = build_mobilenet_attn(cur, block);
+            }
+            else {
+                cur = build_inverted_residual(cur, block, stride);
+            }
 
-            cur = build_inverted_residual_block(cur, block, has_skip, stride);
-
-            // Collect intermediate features at key stages for MSFA
-            // Typically we collect features after certain stages
-            // For simplicity, collect every 4th block's output
-            if ((i + 1) % 4 == 0 || i == total_blocks - 1) {
+            // Collect intermediates for MSFA (Indices 34 and 73 for 300m)
+            if (i == 34 || i == total_blocks - 1) {
                 intermediate_features.push_back(cur);
             }
         }
 
-        // Multi-Scale Fusion Adapter (MSFA)
-        // Resize all intermediate features to the same resolution and concatenate
+        // 3. Multi-Scale Fusion Adapter (MSFA)
         if (!intermediate_features.empty()) {
-            // Get the highest resolution (typically the first feature map)
-            ggml_tensor * target = intermediate_features[0];
-            int target_h = target->ne[1];
-            int target_w = target->ne[0];
+            const int target_res = 16;
+            std::vector<ggml_tensor*> resized_feats;
 
-            // Resize and concatenate all features
-            std::vector<ggml_tensor*> resized_features;
             for (auto feat : intermediate_features) {
-                if (feat->ne[0] != target_w || feat->ne[1] != target_h) {
-                    // Bilinear interpolation to resize
-                    int scale_factor = target_w / feat->ne[0];
-                    feat = ggml_upscale(ctx0, feat, scale_factor, GGML_SCALE_MODE_BILINEAR);
+                if (feat->ne[0] != target_res || feat->ne[1] != target_res) {
+                    if (feat->ne[0] > target_res) {
+                        int s = feat->ne[0] / target_res;
+                        feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
+                    } else {
+                        int s = target_res / feat->ne[0];
+                        feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_BILINEAR);
+                    }
                 }
-                resized_features.push_back(feat);
+                resized_feats.push_back(feat);
             }
 
-            // Concatenate along channel dimension (simplified - actual implementation may differ)
-            cur = resized_features[resized_features.size() - 1];  // Use last feature for now
+            cur = resized_feats[0];
+            for (size_t k = 1; k < resized_feats.size(); ++k) {
+                cur = ggml_concat(ctx0, cur, resized_feats[k], 2); 
+            }
 
-            // Process concatenated features through FFN
             if (model.msfa_ffn_expand_w) {
-                cur = ggml_mul_mat(ctx0, model.msfa_ffn_expand_w, cur);
+                cur = ggml_conv_2d(ctx0, model.msfa_ffn_expand_w, cur, 1, 1, 0, 0, 1, 1);
                 cur = ggml_gelu(ctx0, cur);
             }
             if (model.msfa_ffn_project_w) {
-                cur = ggml_mul_mat(ctx0, model.msfa_ffn_project_w, cur);
+                cur = ggml_conv_2d(ctx0, model.msfa_ffn_project_w, cur, 1, 1, 0, 0, 1, 1);
+            }
+            if (model.msfa_concat_norm_w) {
+                cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
             }
         }
 
-        // Gemma3n-specific projection (same as Gemma3)
-        if (ctx->proj_type() == PROJECTOR_TYPE_GEMMA3N) {
-            // Reshape for processing
-            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3));
+        // 4. Gemma 3n Projection
+        // Input `cur` is [W, H, C, B]. We need to flatten to [C, N, B] where N=W*H and ne0=C.
+        
+        int W = cur->ne[0];
+        int H = cur->ne[1];
+        int C = cur->ne[2];
+        int B = cur->ne[3];
+        
+        // Permute to [C, W, H, B]
+        cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
+        // Reshape to [C, N, B]
+        cur = ggml_reshape_3d(ctx0, cur, C, W*H, B);
+        cur = ggml_cont(ctx0, cur); 
+        // Now cur is {C, N, B} (ne0=C)
 
-            // Apply RMS normalization
+        // Projector: mm.input_projection (Linear)
+        if (model.mm_input_proj_w) {
+            // mm_input_proj_w is {C, OutputDim}
+            // mul_mat(w, x) -> {OutputDim, N, B}
+            cur = ggml_mul_mat(ctx0, model.mm_input_proj_w, cur);
+        }
+
+        // Norm: mm.soft_emb_norm (RMS)
+        if (model.mm_soft_emb_norm_w) {
+            // rms_norm normalizes ne0 (OutputDim)
             cur = ggml_rms_norm(ctx0, cur, eps);
-            if (model.mm_soft_emb_norm_w) {
-                cur = ggml_mul(ctx0, cur, model.mm_soft_emb_norm_w);
-            }
-
-            // Project to language model embedding space
-            if (model.mm_input_proj_w) {
-                cur = ggml_mul_mat(ctx0,
-                    ggml_cont(ctx0, ggml_transpose(ctx0, model.mm_input_proj_w)),
-                    cur);
-            }
+            // mul broadcasts weight {OutputDim, 1, 1} to {OutputDim, N, B}
+            cur = ggml_mul(ctx0, cur, model.mm_soft_emb_norm_w);
         }
-
-        // Build the graph
+        
         ggml_build_forward_expand(gf, cur);
-
         return gf;
     }
 
@@ -3172,94 +3306,164 @@ struct clip_model_loader {
             return cur;
         };
 
-        model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
+        // --- Standard loading for most models ---
+        if (model.proj_type != PROJECTOR_TYPE_GEMMA3N) {
+            model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
 
-        model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
-        model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);
+            model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
+            model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);
 
-        model.post_ln_w = get_tensor(string_format(TN_LN_POST, prefix, "weight"), false);
-        model.post_ln_b = get_tensor(string_format(TN_LN_POST, prefix, "bias"),   false);
+            model.post_ln_w = get_tensor(string_format(TN_LN_POST, prefix, "weight"), false);
+            model.post_ln_b = get_tensor(string_format(TN_LN_POST, prefix, "bias"),   false);
 
-        model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
-        model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
-        model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
+            model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
+            model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
+            model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
 
-        model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
+            model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
 
-        // layers
-        model.layers.resize(hparams.n_layer);
-        for (int il = 0; il < hparams.n_layer; ++il) {
-            auto & layer = model.layers[il];
-            layer.k_w    = get_tensor(string_format(TN_ATTN_K,      prefix, il, "weight"), false);
-            layer.q_w    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "weight"), false);
-            layer.v_w    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "weight"), false);
-            layer.o_w    = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "weight"));
-            layer.qkv_w  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "weight"), false);
-            layer.k_norm = get_tensor(string_format(TN_ATTN_K_NORM, prefix, il, "weight"), false);
-            layer.q_norm = get_tensor(string_format(TN_ATTN_Q_NORM, prefix, il, "weight"), false);
-            layer.ln_1_w = get_tensor(string_format(TN_LN_1,        prefix, il, "weight"), false);
-            layer.ln_2_w = get_tensor(string_format(TN_LN_2,        prefix, il, "weight"), false);
-            layer.ls_1_w = get_tensor(string_format(TN_LS_1,        prefix, il, "weight"), false); // no bias
-            layer.ls_2_w = get_tensor(string_format(TN_LS_2,        prefix, il, "weight"), false); // no bias
+            // layers
+            model.layers.resize(hparams.n_layer);
+            for (int il = 0; il < hparams.n_layer; ++il) {
+                auto & layer = model.layers[il];
+                layer.k_w    = get_tensor(string_format(TN_ATTN_K,      prefix, il, "weight"), false);
+                layer.q_w    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "weight"), false);
+                layer.v_w    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "weight"), false);
+                layer.o_w    = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "weight")); // This usually throws if missing
+                layer.qkv_w  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "weight"), false);
+                layer.k_norm = get_tensor(string_format(TN_ATTN_K_NORM, prefix, il, "weight"), false);
+                layer.q_norm = get_tensor(string_format(TN_ATTN_Q_NORM, prefix, il, "weight"), false);
+                layer.ln_1_w = get_tensor(string_format(TN_LN_1,        prefix, il, "weight"), false);
+                layer.ln_2_w = get_tensor(string_format(TN_LN_2,        prefix, il, "weight"), false);
+                layer.ls_1_w = get_tensor(string_format(TN_LS_1,        prefix, il, "weight"), false);
+                layer.ls_2_w = get_tensor(string_format(TN_LS_2,        prefix, il, "weight"), false);
 
-            layer.k_b    = get_tensor(string_format(TN_ATTN_K,      prefix, il, "bias"), false);
-            layer.q_b    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "bias"), false);
-            layer.v_b    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "bias"), false);
-            layer.o_b    = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "bias"), false);
-            layer.qkv_b  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "bias"), false);
-            layer.ln_1_b = get_tensor(string_format(TN_LN_1,        prefix, il, "bias"), false);
-            layer.ln_2_b = get_tensor(string_format(TN_LN_2,        prefix, il, "bias"), false);
+                layer.k_b    = get_tensor(string_format(TN_ATTN_K,      prefix, il, "bias"), false);
+                layer.q_b    = get_tensor(string_format(TN_ATTN_Q,      prefix, il, "bias"), false);
+                layer.v_b    = get_tensor(string_format(TN_ATTN_V,      prefix, il, "bias"), false);
+                layer.o_b    = get_tensor(string_format(TN_ATTN_OUTPUT, prefix, il, "bias"), false);
+                layer.qkv_b  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "bias"), false);
+                layer.ln_1_b = get_tensor(string_format(TN_LN_1,        prefix, il, "bias"), false);
+                layer.ln_2_b = get_tensor(string_format(TN_LN_2,        prefix, il, "bias"), false);
 
-            // ffn
-            layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "weight"));
-            layer.ff_up_b   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "bias"),   false);
-            layer.ff_gate_w = get_tensor(string_format(TN_FFN_GATE, prefix, il, "weight"), false);
-            layer.ff_gate_b = get_tensor(string_format(TN_FFN_GATE, prefix, il, "bias"),   false);
-            layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "weight"));
-            layer.ff_down_b = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "bias"),   false);
+                // ffn
+                layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "weight"));
+                layer.ff_up_b   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "bias"),   false);
+                layer.ff_gate_w = get_tensor(string_format(TN_FFN_GATE, prefix, il, "weight"), false);
+                layer.ff_gate_b = get_tensor(string_format(TN_FFN_GATE, prefix, il, "bias"),   false);
+                layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "weight"));
+                layer.ff_down_b = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "bias"),   false);
 
+                // qwen3vl deepstack layer
+                layer.deepstack_norm_w = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "weight"), false);
+                layer.deepstack_norm_b = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "bias"), false);
+                layer.deepstack_fc1_w  = get_tensor(string_format(TN_DEEPSTACK_FC1,  il, "weight"), false);
+                layer.deepstack_fc1_b  = get_tensor(string_format(TN_DEEPSTACK_FC1,  il, "bias"), false);
+                layer.deepstack_fc2_w  = get_tensor(string_format(TN_DEEPSTACK_FC2,  il, "weight"), false);
+                layer.deepstack_fc2_b  = get_tensor(string_format(TN_DEEPSTACK_FC2,  il, "bias"), false);
+                if (layer.has_deepstack()) {
+                    model.n_deepstack_layers++;
+                }
 
-            // qwen3vl deepstack layer
-            layer.deepstack_norm_w = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "weight"), false);
-            layer.deepstack_norm_b = get_tensor(string_format(TN_DEEPSTACK_NORM, il, "bias"), false);
-            layer.deepstack_fc1_w  = get_tensor(string_format(TN_DEEPSTACK_FC1,  il, "weight"), false);
-            layer.deepstack_fc1_b  = get_tensor(string_format(TN_DEEPSTACK_FC1,  il, "bias"), false);
-            layer.deepstack_fc2_w  = get_tensor(string_format(TN_DEEPSTACK_FC2,  il, "weight"), false);
-            layer.deepstack_fc2_b  = get_tensor(string_format(TN_DEEPSTACK_FC2,  il, "bias"), false);
-            if (layer.has_deepstack()) {
-                model.n_deepstack_layers++;
+                // Check for swapped ffn weights (legacy models)
+                bool is_ffn_swapped = (
+                        model.proj_type == PROJECTOR_TYPE_MLP ||
+                        model.proj_type == PROJECTOR_TYPE_MLP_NORM ||
+                        model.proj_type == PROJECTOR_TYPE_LDP ||
+                        model.proj_type == PROJECTOR_TYPE_LDPV2 ||
+                        model.proj_type == PROJECTOR_TYPE_QWEN2VL ||
+                        model.proj_type == PROJECTOR_TYPE_QWEN25VL ||
+                        model.proj_type == PROJECTOR_TYPE_GLM_EDGE ||
+                        model.proj_type == PROJECTOR_TYPE_GEMMA3 ||
+                        model.proj_type == PROJECTOR_TYPE_IDEFICS3 ||
+                        model.proj_type == PROJECTOR_TYPE_MINICPMV
+                    ) && layer.ff_up_w && layer.ff_down_w && layer.ff_down_w->ne[0] == hparams.n_embd;
+                
+                if (is_ffn_swapped) {
+                    std::swap(layer.ff_up_w, layer.ff_down_w);
+                    std::swap(layer.ff_up_b, layer.ff_down_b);
+                    if (il == 0) LOG_WRN("%s: ffn up/down are swapped\n", __func__);
+                }
             }
+        }
+        // --- Special Loading for Gemma 3n (MobileNetV5) ---
+        else if (model.proj_type == PROJECTOR_TYPE_GEMMA3N) {
+            LOG_INF("%s: Loading Gemma3n (MobileNetV5) tensors...\n", __func__);
+            
+            // Stem
+            model.mobilenet_stem_conv_w = get_tensor(TN_MNV5_STEM_CONV, false);
+            model.mobilenet_stem_norm_w = get_tensor(TN_MNV5_STEM_BN, false);
 
-            // some models already exported with legacy (incorrect) naming which is quite messy, let's fix it here
-            // note: Qwen model converted from the old surgery script has n_ff = 0, so we cannot use n_ff to check!
-            bool is_ffn_swapped = (
-                    // only old models need this fix
-                    model.proj_type == PROJECTOR_TYPE_MLP
-                    || model.proj_type == PROJECTOR_TYPE_MLP_NORM
-                    || model.proj_type == PROJECTOR_TYPE_LDP
-                    || model.proj_type == PROJECTOR_TYPE_LDPV2
-                    || model.proj_type == PROJECTOR_TYPE_QWEN2VL
-                    || model.proj_type == PROJECTOR_TYPE_QWEN25VL
-                    || model.proj_type == PROJECTOR_TYPE_GLM_EDGE
-                    || model.proj_type == PROJECTOR_TYPE_GEMMA3
-                    || model.proj_type == PROJECTOR_TYPE_IDEFICS3
-                    || model.proj_type == PROJECTOR_TYPE_MINICPMV
-                ) && layer.ff_up_w && layer.ff_down_w && layer.ff_down_w->ne[0] == hparams.n_embd;
-            if (is_ffn_swapped) {
-                // swap up and down weights
-                ggml_tensor * tmp = layer.ff_up_w;
-                layer.ff_up_w = layer.ff_down_w;
-                layer.ff_down_w = tmp;
-                // swap up and down biases
-                tmp = layer.ff_up_b;
-                layer.ff_up_b = layer.ff_down_b;
-                layer.ff_down_b = tmp;
-                if (il == 0) {
-                    LOG_WRN("%s: ffn up/down are swapped\n", __func__);
+            // MSFA (Multi-Scale Fusion Adapter)
+            model.msfa_ffn_expand_w  = get_tensor(TN_MNV5_MSFA_FFN_EXP_W, false);
+            // BN for expand? Check logs. If "v.enc.msfa.ffn.pw_exp.bn.weight" exists:
+            get_tensor(TN_MNV5_MSFA_FFN_EXP_BN, false); // Consuming it to avoid unused tensor warnings if we track them, or map if needed
+            model.msfa_ffn_project_w = get_tensor(TN_MNV5_MSFA_FFN_PROJ_W, false);
+            // BN for proj? 
+            get_tensor(TN_MNV5_MSFA_FFN_PROJ_BN, false);
+            model.msfa_concat_norm_w = get_tensor(TN_MNV5_MSFA_NORM, false);
+
+            // Blocks
+            // We iterate through stages 0 to 3. There is no explicit block count per stage in hparams usually,
+            // so we iterate block indices until we fail to find a tensor.
+            for (int stage = 0; stage < 4; ++stage) {
+                for (int blk_idx = 0; ; ++blk_idx) {
+                    bool found_block = false;
+                    mobilenetv5_block block;
+
+                    // Try to identify block type by probing unique tensors
+                    // Stage 0: Edge Residual (has conv_exp)
+                    block.s0_conv_exp_w = get_tensor(string_format(TN_MNV5_BLK_S0_EXP_W, stage, blk_idx), false);
+                    
+                    if (block.s0_conv_exp_w) {
+                        found_block = true;
+                        block.s0_bn1_w      = get_tensor(string_format(TN_MNV5_BLK_S0_BN1_W, stage, blk_idx), false);
+                        block.s0_conv_pwl_w = get_tensor(string_format(TN_MNV5_BLK_S0_PWL_W, stage, blk_idx), false);
+                        block.s0_bn2_w      = get_tensor(string_format(TN_MNV5_BLK_S0_BN2_W, stage, blk_idx), false);
+                    } else {
+                        // Stage 1+: UIR (has dw_start)
+                        block.dw_start_w = get_tensor(string_format(TN_MNV5_BLK_DW_START_W, stage, blk_idx), false);
+                        
+                        if (block.dw_start_w) {
+                            found_block = true;
+                            block.dw_start_bn_w = get_tensor(string_format(TN_MNV5_BLK_DW_START_BN, stage, blk_idx), false);
+                            
+                            // Load UIR parts
+                            block.pw_exp_w      = get_tensor(string_format(TN_MNV5_BLK_PW_EXP_W, stage, blk_idx), false);
+                            block.pw_exp_bn_w   = get_tensor(string_format(TN_MNV5_BLK_PW_EXP_BN, stage, blk_idx), false);
+                            block.dw_mid_w      = get_tensor(string_format(TN_MNV5_BLK_DW_MID_W, stage, blk_idx), false);
+                            block.dw_mid_bn_w   = get_tensor(string_format(TN_MNV5_BLK_DW_MID_BN, stage, blk_idx), false);
+                            block.pw_proj_w     = get_tensor(string_format(TN_MNV5_BLK_PW_PROJ_W, stage, blk_idx), false);
+                            block.pw_proj_bn_w  = get_tensor(string_format(TN_MNV5_BLK_PW_PROJ_BN, stage, blk_idx), false);
+                            block.layer_scale_w = get_tensor(string_format(TN_MNV5_BLK_LAYER_SCALE, stage, blk_idx), false);
+
+                            // Load Attention (MQA) components if present
+                            block.attn_q_w      = get_tensor(string_format(TN_MNV5_ATTN_Q_W, stage, blk_idx), false);
+                            if (block.attn_q_w) {
+                                block.attn_k_w = get_tensor(string_format(TN_MNV5_ATTN_K_W, stage, blk_idx), false);
+                                block.attn_v_w = get_tensor(string_format(TN_MNV5_ATTN_V_W, stage, blk_idx), false);
+                                block.attn_o_w = get_tensor(string_format(TN_MNV5_ATTN_O_W, stage, blk_idx), false);
+                                
+                                block.attn_k_dw_w   = get_tensor(string_format(TN_MNV5_ATTN_K_DW, stage, blk_idx), false);
+                                block.attn_k_norm_w = get_tensor(string_format(TN_MNV5_ATTN_K_NORM, stage, blk_idx), false);
+                                block.attn_v_dw_w   = get_tensor(string_format(TN_MNV5_ATTN_V_DW, stage, blk_idx), false);
+                                block.attn_v_norm_w = get_tensor(string_format(TN_MNV5_ATTN_V_NORM, stage, blk_idx), false);
+                                block.attn_norm_w   = get_tensor(string_format(TN_MNV5_ATTN_NORM, stage, blk_idx), false);
+                            }
+                        }
+                    }
+
+                    if (found_block) {
+                        model.mobilenet_blocks.push_back(block);
+                    } else {
+                        // End of blocks for this stage
+                        break;
+                    }
                 }
             }
         }
 
+        // --- Projector loading (Same as before) ---
         switch (model.proj_type) {
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
@@ -3384,11 +3588,8 @@ struct clip_model_loader {
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
 
                     // Load additional Gemma3n projection tensors
-                    model.mm_0_w = get_tensor("mm.embedding", false);  // Input embedding
-                    model.mm_1_w = get_tensor("mm.hard_emb_norm", false);  // Hard embedding norm
-
-                    // MobileNetV5 weights are loaded dynamically below
-                    // All v.enc.* tensors will be loaded in the general tensor loading loop
+                    model.mm_0_w = get_tensor("mm.embedding.weight", false);  // Input embedding
+                    model.mm_1_w = get_tensor("mm.hard_emb_norm.weight", false);  // Hard embedding norm
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
                 {
