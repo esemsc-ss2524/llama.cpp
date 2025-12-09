@@ -596,20 +596,30 @@ struct clip_graph {
     // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
     ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f) {
         // inp: [W, H, C, B]
+        const int W = inp->ne[0];
+        const int H = inp->ne[1];
+        const int C = inp->ne[2];
+        const int B = inp->ne[3];
+
         // Permute to [C, W, H, B]
         ggml_tensor * cur = ggml_permute(ctx0, inp, 2, 0, 1, 3);
         cur = ggml_cont(ctx0, cur);
-        
+
+        // Reshape to [C, W*H*B] for RMS norm
+        cur = ggml_reshape_2d(ctx0, cur, C, W * H * B);
+
         // Apply RMS Norm (normalizes first dimension C)
         cur = ggml_rms_norm(ctx0, cur, eps);
-        
+
         // Apply weight (Scale)
         if (weight) {
-            // weight is {C, 1, 1, 1}
-            // cur is {C, W, H, B}
-            // ggml_mul broadcasts 1s in weight to match W, H, B
+            // weight is [C], cur is [C, W*H*B]
+            // ggml_mul will broadcast along the second dimension
             cur = ggml_mul(ctx0, cur, weight);
         }
+
+        // Reshape back to [C, W, H, B]
+        cur = ggml_reshape_4d(ctx0, cur, C, W, H, B);
 
         // Permute back to [W, H, C, B]
         cur = ggml_permute(ctx0, cur, 1, 2, 0, 3);
