@@ -596,13 +596,16 @@ struct clip_graph {
     // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
     ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f) {
         // inp: [W, H, C, B]
-        const int W = inp->ne[0];
-        const int H = inp->ne[1];
-        const int C = inp->ne[2];
-        const int B = inp->ne[3];
+        const int64_t W = inp->ne[0];
+        const int64_t H = inp->ne[1];
+        const int64_t C = inp->ne[2];
+        const int64_t B = inp->ne[3];
 
-        // Permute to [C, W, H, B]
-        ggml_tensor * cur = ggml_permute(ctx0, inp, 2, 0, 1, 3);
+        // Flatten spatial dimensions: [W, H, C, B] -> [W*H, C, B]
+        ggml_tensor * cur = ggml_reshape_3d(ctx0, inp, W * H, C, B);
+
+        // Permute to [C, W*H, B]
+        cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
         cur = ggml_cont(ctx0, cur);
 
         // Reshape to [C, W*H*B] for RMS norm
@@ -618,12 +621,17 @@ struct clip_graph {
             cur = ggml_mul(ctx0, cur, weight);
         }
 
-        // Reshape back to [C, W, H, B]
-        cur = ggml_reshape_4d(ctx0, cur, C, W, H, B);
+        // Reshape back to [C, W*H, B]
+        cur = ggml_reshape_3d(ctx0, cur, C, W * H, B);
 
-        // Permute back to [W, H, C, B]
-        cur = ggml_permute(ctx0, cur, 1, 2, 0, 3);
-        return ggml_cont(ctx0, cur);
+        // Permute to [W*H, C, B]
+        cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
+        cur = ggml_cont(ctx0, cur);
+
+        // Reshape to [W, H, C, B]
+        cur = ggml_reshape_4d(ctx0, cur, W, H, C, B);
+
+        return cur;
     }
 
 
