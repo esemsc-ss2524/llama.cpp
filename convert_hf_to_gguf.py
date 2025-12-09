@@ -6026,6 +6026,37 @@ class Gemma3nVisionModel(MmprojModel):
         # Parent init will call find_hparam which now returns 0 for empty keys
         super().__init__(*args, **kwargs)
 
+    def find_vparam(self, keys: list[str], optional: bool = False) -> Any:
+        """Override to provide hardcoded MobileNetV5 parameters that aren't in config"""
+        # MobileNetV5 hardcodes these values in the architecture definition
+        # rather than storing them in config.json
+
+        # Check if we're looking for image_size
+        if "image_size" in keys:
+            # MobileNetV5 300m_enc uses 768x768 input
+            return 768
+
+        # Check if we're looking for patch_size
+        if "patch_size" in keys:
+            # MobileNetV5 is CNN-based, doesn't use patches
+            # Set to 1 for compatibility
+            return 1
+
+        # Check if we're looking for intermediate_size
+        if "intermediate_size" in keys:
+            # MobileNetV5 uses expansion ratios in inverted residual blocks
+            # Typical expansion is 4x the embedding dimension
+            hidden_size = self.hparams_vision.get("hidden_size", 2048)
+            return hidden_size * 4
+
+        # Check if we're looking for num_attention_heads
+        if "num_attention_heads" in keys or "num_heads" in keys:
+            # MobileNetV5 uses Multi-Query Attention with 8 heads
+            return 8
+
+        # For other parameters, use parent implementation
+        return super().find_vparam(keys, optional)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
