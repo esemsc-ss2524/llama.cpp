@@ -6122,14 +6122,16 @@ class Gemma3nVisionModel(MmprojModel):
 
     def map_tensor_name(self, name: str) -> str:
         """Map Gemma3n tensor names to GGUF format"""
-        # Projector tensors (from embed_vision) - use mm. prefix like Gemma3        if name == "embedding.weight":
-            return "mm.embedding"  # Input embedding
+        # Projector tensors (from embed_vision) - use mm. prefix like Gemma3
+        # IMPORTANT: Keep the .weight suffix to match C++ expectations
+        if name == "embedding.weight":
+            return "mm.embedding.weight"
         if name == "embedding_projection.weight":
-            return "mm.input_projection"  # Main projection used by C++
+            return "mm.input_projection.weight"  # Main projection used by C++
         if name == "hard_emb_norm.weight":
-            return "mm.hard_emb_norm"  # Hard embedding normalization
+            return "mm.hard_emb_norm.weight"  # Hard embedding normalization
         if name == "soft_emb_norm.weight":
-            return "mm.soft_emb_norm"  # Soft embedding normalization (used by C++)
+            return "mm.soft_emb_norm.weight"  # Soft embedding normalization (used by C++)
 
         # Vision tower tensors - add v.enc. prefix for MobileNetV5 encoder
         if name.startswith("vision_tower."):
