@@ -3379,23 +3379,16 @@ struct clip_model_loader {
                 } break;
             case PROJECTOR_TYPE_GEMMA3N:
                 {
-                    // Load projection weights (same as Gemma3)
+                    // Load projection weights (similar to Gemma3)
                     model.mm_input_proj_w = get_tensor(TN_MM_INP_PROJ);
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
 
-                    // Load MobileNetV5 stem weights
-                    model.mobilenet_stem_conv_w = get_tensor("v.mobilenet.stem.conv.weight", false);
-                    model.mobilenet_stem_norm_w = get_tensor("v.mobilenet.stem.norm.weight", false);
+                    // Load additional Gemma3n projection tensors
+                    model.mm_0_w = get_tensor("mm.embedding", false);  // Input embedding
+                    model.mm_1_w = get_tensor("mm.hard_emb_norm", false);  // Hard embedding norm
 
-                    // Load MobileNetV5 block weights (dynamic loading based on model architecture)
-                    // Blocks will be loaded during the weight loading phase
-                    // This is a placeholder - actual implementation will load blocks dynamically
-
-                    // Load MSFA weights
-                    model.msfa_concat_conv_w = get_tensor("v.mobilenet.msfa.concat_conv.weight", false);
-                    model.msfa_concat_norm_w = get_tensor("v.mobilenet.msfa.concat_norm.weight", false);
-                    model.msfa_ffn_expand_w = get_tensor("v.mobilenet.msfa.ffn_expand.weight", false);
-                    model.msfa_ffn_project_w = get_tensor("v.mobilenet.msfa.ffn_project.weight", false);
+                    // MobileNetV5 weights are loaded dynamically below
+                    // All v.enc.* tensors will be loaded in the general tensor loading loop
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
                 {

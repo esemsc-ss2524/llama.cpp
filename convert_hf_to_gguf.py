@@ -508,7 +508,11 @@ class ModelBase:
         return ()
 
     def prepare_tensors(self):
-        max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
+        # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
+        if self.tensor_map.mapping:
+            max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
+        else:
+            max_name_len = len("vision_encoder.weight,")  # Default reasonable length
 
         for name, data_torch in chain(self.generate_extra_tensors(), self.get_tensors()):
             # we don't need these
@@ -6022,12 +6026,47 @@ class Gemma3nVisionModel(MmprojModel):
         # Parent init will call find_hparam which now returns 0 for empty keys
         super().__init__(*args, **kwargs)
 
+    def find_vparam(self, keys: list[str], optional: bool = False) -> Any:
+        """Override to provide hardcoded MobileNetV5 parameters that aren't in config"""
+        # MobileNetV5 hardcodes these values in the architecture definition
+        # rather than storing them in config.json
+
+        # Handle empty keys list (n_block_keys) - return 0 for CNN architecture
+        if not keys:
+            return 0
+
+        # Check if we're looking for image_size
+        if "image_size" in keys:
+            # MobileNetV5 300m_enc uses 768x768 input
+            return 768
+
+        # Check if we're looking for patch_size
+        if "patch_size" in keys:
+            # MobileNetV5 is CNN-based, doesn't use patches
+            # Set to 1 for compatibility
+            return 1
+
+        # Check if we're looking for intermediate_size
+        if "intermediate_size" in keys:
+            # MobileNetV5 uses expansion ratios in inverted residual blocks
+            # Typical expansion is 4x the embedding dimension
+            hidden_size = self.hparams_vision.get("hidden_size", 2048)
+            return hidden_size * 4
+
+        # Check if we're looking for num_attention_heads
+        if "num_attention_heads" in keys or "num_heads" in keys:
+            # MobileNetV5 uses Multi-Query Attention with 8 heads
+            return 8
+
+        # For other parameters, use parent implementation
+        return super().find_vparam(keys, optional)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
 
         # Set projector type to GEMMA3N
-        self.gguf_writer.add_clip_projector_type(gguf.VISION_PROJECTOR_TYPE.GEMMA3N)
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.GEMMA3N)
 
         # MobileNetV5 specific parameters
         self.gguf_writer.add_vision_attention_layernorm_eps(hparams.get("layer_norm_eps", 1e-6))
@@ -6048,27 +6087,66 @@ class Gemma3nVisionModel(MmprojModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
 
+        # Gemma3n uses different prefixes than other models:
+        # - model.embed_vision.* for projection layers
+        # - model.vision_tower.* for vision encoder
         # Skip non-vision tensors
-        if not (name.startswith("multi_modal_projector.") or
-                name.startswith("vision_tower.") or
-                name.startswith("multimodal_projector.") or
-                name.startswith("vision_model.")):
+        if not (name.startswith("model.embed_vision.") or
+                name.startswith("model.vision_tower.")):
             return []
+
+        # Strip "model." prefix to match expected llama.cpp format
+        if name.startswith("model."):
+            name = name[6:]  # Remove "model." prefix
 
         # Process MobileNetV5 and projection tensors
         name = name.replace("_weight", ".weight")
 
+        # Rename embed_vision to match our C++ implementation expectations
+        name = name.replace("embed_vision.", "")
+
+        # Rename vision_tower.timm_model to vision_tower for cleaner naming
+        name = name.replace("vision_tower.timm_model.", "vision_tower.")
+
+        # Handle normalization layer naming
+        name = name.replace("hard_embedding_norm", "hard_emb_norm")
+        name = name.replace("soft_embedding_norm", "soft_emb_norm")
+
         # Gemma3n uses Gemma3p5RMSNorm which has scale_shift=0, so no correction needed
         # Unlike Gemma3 which uses Gemma3RMSNorm with scale_shift=1
-        # Only apply correction if explicitly needed based on the norm type
         if "soft_emb_norm.weight" in name:
-            # For Gemma3n, typically no correction needed, but check model version
-            # If the model uses Gemma3RMSNorm style, uncomment below:
-            # logger.info(f"Correcting norm value for '{name}'")
-            # data_torch = data_torch + 1
+            # No correction needed for Gemma3n
             pass
 
         return [(self.map_tensor_name(name), data_torch)]
+
+    def map_tensor_name(self, name: str) -> str:
+        """Map Gemma3n tensor names to GGUF format"""
+        # Projector tensors (from embed_vision) - use mm. prefix like Gemma3
+        # IMPORTANT: Keep the .weight suffix to match C++ expectations
+        if name == "embedding.weight":
+            return "mm.embedding.weight"
+        if name == "embedding_projection.weight":
+            return "mm.input_projection.weight"  # Main projection used by C++
+        if name == "hard_emb_norm.weight":
+            return "mm.hard_emb_norm.weight"  # Hard embedding normalization
+        if name == "soft_emb_norm.weight":
+            return "mm.soft_emb_norm.weight"  # Soft embedding normalization (used by C++)
+
+        # Vision tower tensors - add v.enc. prefix for MobileNetV5 encoder
+        if name.startswith("vision_tower."):
+            # Remove vision_tower prefix and add v.enc. prefix
+            tensor_suffix = name[13:]  # Remove "vision_tower."
+            return f"v.enc.{tensor_suffix}"
+
+        # If no match, try parent implementation
+        try:
+            return super().map_tensor_name(name)
+        except ValueError:
+            # If parent also can't map it, provide a sensible default
+            # This shouldn't happen, but provides a fallback
+            logger.warning(f"Using fallback mapping for tensor: {name}")
+            return f"v.{name}"
 
 
 @ModelBase.register("Gemma3nForCausalLM")
