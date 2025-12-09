@@ -421,6 +421,7 @@ struct clip_model {
     std::vector<mobilenetv5_block> mobilenet_blocks;
     std::vector<int> mobilenet_stage_ends; // NEW: Track end indices of stages
     ggml_tensor * mobilenet_stem_conv_w = nullptr;
+    ggml_tensor * mobilenet_stem_conv_b = nullptr;
     ggml_tensor * mobilenet_stem_norm_w = nullptr;
 
     // Multi-Scale Fusion Adapter (MSFA) components
@@ -694,12 +695,13 @@ struct clip_graph {
         // 5. Residual Connection
         bool same_spatial = (inp->ne[0] == cur->ne[0]) && (inp->ne[1] == cur->ne[1]);
         bool same_channel = (inp->ne[2] == cur->ne[2]);
-        
+
         if (same_spatial && same_channel) {
             if (block.layer_scale_w) {
                 ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
                 scaled = ggml_mul(ctx0, scaled, block.layer_scale_w);
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
+                cur = ggml_cont(ctx0, cur);
             }
             cur = ggml_add(ctx0, cur, inp);
         }
@@ -766,7 +768,16 @@ struct clip_graph {
         ggml_tensor* o_w = fix_1x1_weight(block.attn_o_w);
         cur = ggml_conv_2d(ctx0, o_w, kqv, 1, 1, 0, 0, 1, 1);
 
+        // Apply layer_scale and residual connection
         if (inp->ne[0] == cur->ne[0] && inp->ne[2] == cur->ne[2]) {
+            if (block.layer_scale_w) {
+                // layer_scale_w is [C], cur is [W, H, C, B]
+                // Permute to [C, W, H, B], apply scale, permute back
+                ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
+                scaled = ggml_mul(ctx0, scaled, block.layer_scale_w);
+                cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
+                cur = ggml_cont(ctx0, cur);
+            }
             cur = ggml_add(ctx0, cur, inp);
         }
         return cur;
@@ -797,6 +808,9 @@ struct clip_graph {
 
         // 1. Stem
         ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
+        if (model.mobilenet_stem_conv_b) {
+            cur = ggml_add(ctx0, cur, model.mobilenet_stem_conv_b);
+        }
         if (model.mobilenet_stem_norm_w) cur = rms_norm_2d(cur, model.mobilenet_stem_norm_w);
         cur = ggml_gelu(ctx0, cur);
         
@@ -3402,8 +3416,9 @@ struct clip_model_loader {
         else // --- Special Loading for Gemma 3n (MobileNetV5) - FIXED ---
         if (model.proj_type == PROJECTOR_TYPE_GEMMA3N) {
             LOG_INF("%s: Loading Gemma3n (MobileNetV5) tensors...\n", __func__);
-            
+
             model.mobilenet_stem_conv_w = get_tensor(TN_MNV5_STEM_CONV, false);
+            model.mobilenet_stem_conv_b = get_tensor(TN_MNV5_STEM_BIAS, false);
             model.mobilenet_stem_norm_w = get_tensor(TN_MNV5_STEM_BN, false);
 
             model.msfa_ffn_expand_w  = get_tensor(TN_MNV5_MSFA_FFN_EXP_W, false);
@@ -3433,18 +3448,26 @@ struct clip_model_loader {
                     } 
                     // 2. Check for UIR (Universal Inverted Residual)
                     else {
-                        // We check dw_start OR pw_exp to be safe, but dw_start is standard for UIR
+                        // Check for dw_start OR pw_exp (some UIR blocks skip dw_start)
                         block.dw_start_w = get_tensor(string_format(TN_MNV5_BLK_DW_START_W, stage, blk_idx), false);
-                        
-                        if (block.dw_start_w) {
+                        block.pw_exp_w   = get_tensor(string_format(TN_MNV5_BLK_PW_EXP_W, stage, blk_idx), false);
+
+                        if (block.dw_start_w || block.pw_exp_w) {
                             found_block = true;
-                            block.dw_start_bn_w = get_tensor(string_format(TN_MNV5_BLK_DW_START_BN, stage, blk_idx), false);
-                            block.pw_exp_w      = get_tensor(string_format(TN_MNV5_BLK_PW_EXP_W, stage, blk_idx), false);
-                            block.pw_exp_bn_w   = get_tensor(string_format(TN_MNV5_BLK_PW_EXP_BN, stage, blk_idx), false);
+                            if (block.dw_start_w) {
+                                block.dw_start_bn_w = get_tensor(string_format(TN_MNV5_BLK_DW_START_BN, stage, blk_idx), false);
+                            }
+                            if (block.pw_exp_w) {
+                                block.pw_exp_bn_w   = get_tensor(string_format(TN_MNV5_BLK_PW_EXP_BN, stage, blk_idx), false);
+                            }
                             block.dw_mid_w      = get_tensor(string_format(TN_MNV5_BLK_DW_MID_W, stage, blk_idx), false);
-                            block.dw_mid_bn_w   = get_tensor(string_format(TN_MNV5_BLK_DW_MID_BN, stage, blk_idx), false);
+                            if (block.dw_mid_w) {
+                                block.dw_mid_bn_w   = get_tensor(string_format(TN_MNV5_BLK_DW_MID_BN, stage, blk_idx), false);
+                            }
                             block.pw_proj_w     = get_tensor(string_format(TN_MNV5_BLK_PW_PROJ_W, stage, blk_idx), false);
-                            block.pw_proj_bn_w  = get_tensor(string_format(TN_MNV5_BLK_PW_PROJ_BN, stage, blk_idx), false);
+                            if (block.pw_proj_w) {
+                                block.pw_proj_bn_w  = get_tensor(string_format(TN_MNV5_BLK_PW_PROJ_BN, stage, blk_idx), false);
+                            }
                             block.layer_scale_w = get_tensor(string_format(TN_MNV5_BLK_LAYER_SCALE, stage, blk_idx), false);
                         }
                     }
