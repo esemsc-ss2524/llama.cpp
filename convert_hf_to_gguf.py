@@ -6066,7 +6066,7 @@ class Gemma3nVisionModel(MmprojModel):
         hparams = self.hparams
 
         # Set projector type to GEMMA3N
-        self.gguf_writer.add_clip_projector_type(gguf.VISION_PROJECTOR_TYPE.GEMMA3N)
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.GEMMA3N)
 
         # MobileNetV5 specific parameters
         self.gguf_writer.add_vision_attention_layernorm_eps(hparams.get("layer_norm_eps", 1e-6))
@@ -6086,6 +6086,13 @@ class Gemma3nVisionModel(MmprojModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
+
+        # Debug: Log first few tensor names to understand the structure
+        if not hasattr(self, '_debug_tensor_count'):
+            self._debug_tensor_count = 0
+        if self._debug_tensor_count < 10:
+            logger.info(f"DEBUG: Tensor name: {name}")
+            self._debug_tensor_count += 1
 
         # Skip non-vision tensors
         if not (name.startswith("multi_modal_projector.") or
