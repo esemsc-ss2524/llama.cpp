@@ -4886,6 +4886,7 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
 
         case PROJECTOR_TYPE_GLM_EDGE:
         case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_GEMMA3N:
         case PROJECTOR_TYPE_INTERNVL: // TODO @ngxson : support dynamic resolution
             {
                 clip_image_u8 resized_image;
