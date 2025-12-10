@@ -789,29 +789,38 @@ struct clip_graph {
         v = ggml_reshape_4d(ctx0, v, M, D, 1, B);              // [M, D, 1, B]
         v = ggml_cont(ctx0, v);                                 // Keep as [M, D, 1, B]
 
-        // --- Multi-Query Attention with Explicit Broadcasting ---
+        // --- Multi-Query Attention ---
+        // Following PyTorch scaled_dot_product_attention logic:
+        // attn = softmax(q @ k.T * scale)
+        // out = attn @ v
+
         float scale = 1.0f / sqrtf((float)D);
 
-        // Broadcast K to match Q's multi-head structure
-        // k: [D, M, 1, B] -> k_rep: [D, M, n_head, B]
-        ggml_tensor * k_rep = ggml_repeat(ctx0, k, q);
+        // Step 1: Broadcast K to all heads: [D, M, 1, B] -> [D, M, n_head, B]
+        ggml_tensor * k_broadcast = ggml_repeat(ctx0, k, q);
 
-        // Compute attention weights: kq = k_rep^T @ q
-        // k_rep: [D, M, n_head, B], q: [D, N, n_head, B] -> kq: [M, N, n_head, B]
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k_rep, q);
-        kq = ggml_soft_max_ext(ctx0, kq, nullptr, scale, 0.0f);
+        // Step 2: Compute Q @ K.T -> attention scores
+        // q: [D, N, n_head, B], k_broadcast: [D, M, n_head, B]
+        // Result: [N, M, n_head, B]
+        ggml_tensor * scores = ggml_mul_mat(ctx0, k_broadcast, q);
+        scores = ggml_scale(ctx0, scores, scale);
+        scores = ggml_soft_max(ctx0, scores);
 
-        // Broadcast V to match kq's multi-head structure
-        // v: [M, D, 1, B] -> v_rep: [M, D, n_head, B]
-        ggml_tensor * v_rep = v;
-        if (n_head > 1) {
-            // Create a target tensor with the desired shape for broadcasting
-            v_rep = ggml_repeat(ctx0, v, kq);  // Use kq as shape template
-        }
+        // Step 3: Permute V to [M, D, 1, B] for multiplication
+        v = ggml_permute(ctx0, v, 1, 0, 2, 3); // [M, D, 1, B]
+        v = ggml_cont(ctx0, v);
 
-        // Compute attention output: kqv = v_rep^T @ kq
-        // v_rep: [M, D, n_head, B], kq: [M, N, n_head, B] -> kqv: [D, N, n_head, B]
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_rep, kq);
+        // Step 4: Broadcast V to all heads: [M, D, 1, B] -> [M, D, n_head, B]
+        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, scores);
+
+        // Step 5: Compute attn @ V -> output
+        // scores: [N, M, n_head, B], v_broadcast: [M, D, n_head, B]
+        // Result: [N, D, n_head, B]
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_broadcast, scores);
+
+        // Permute to [D, N, n_head, B] for output reshaping
+        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3);
+        kqv = ggml_cont(ctx0, kqv);
 
         // --- Reshape back to spatial layout ---
         // kqv: [D, N, n_head, B] -> [W, H, D*n_head, B]
