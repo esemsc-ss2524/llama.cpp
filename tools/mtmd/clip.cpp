@@ -807,17 +807,20 @@ struct clip_graph {
         scores = ggml_scale(ctx0, scores, scale);
         scores = ggml_soft_max(ctx0, scores);
 
-        // Step 3: Permute V to [M, D, 1, B] for multiplication
-        v = ggml_permute(ctx0, v, 1, 0, 2, 3); // [M, D, 1, B]
+        // Step 3: Broadcast V to all heads by matching k_broadcast's dimension order
+        // First permute V from [M, D, 1, B] to [D, M, 1, B] to match k_broadcast
+        v = ggml_permute(ctx0, v, 1, 0, 2, 3); // [D, M, 1, B]
         v = ggml_cont(ctx0, v);
 
-        // Step 4: Broadcast V to all heads: [M, D, 1, B] -> [M, D, n_head, B]
-        // Use k_broadcast as template since it has [D, M, n_head, B], we need [M, D, n_head, B]
-        // Create proper target by permuting k_broadcast shape
-        ggml_tensor * v_target = ggml_permute(ctx0, k_broadcast, 1, 0, 2, 3); // [M, D, n_head, B]
-        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, v_target);
+        // Step 4: Broadcast V over heads: [D, M, 1, B] -> [D, M, n_head, B]
+        // Now dimensions match k_broadcast [D, M, n_head, B] except for dim 2
+        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, k_broadcast);
 
-        // Step 5: Compute attn @ V -> output
+        // Step 5: Permute V back to [M, D, n_head, B] for multiplication
+        v_broadcast = ggml_permute(ctx0, v_broadcast, 1, 0, 2, 3); // [M, D, n_head, B]
+        v_broadcast = ggml_cont(ctx0, v_broadcast);
+
+        // Step 6: Compute attn @ V -> output
         // scores: [M, N, n_head, B], v_broadcast: [M, D, n_head, B]
         // Result: [D, N, n_head, B]
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v_broadcast, scores);
