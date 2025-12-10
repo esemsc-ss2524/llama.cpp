@@ -937,7 +937,7 @@ struct clip_graph {
                     } else if (feat_res < target_res && target_res % feat_res == 0) {
                         // Integer upsampling
                         int s = target_res / feat_res;
-                        feat = ggml_upscale(ctx0, feat, s);
+                        feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_NEAREST);
                     } else {
                         // Non-integer scale - use interpolation
                         // For now, use adaptive pooling by calculating proper kernel/stride
@@ -952,7 +952,7 @@ struct clip_graph {
                             // Upsampling: use nearest neighbor scaling
                             // Calculate scale as close integer approximation
                             int s = (target_res + feat_res - 1) / feat_res;
-                            feat = ggml_upscale(ctx0, feat, s);
+                            feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_NEAREST);
                             // May need additional pooling if overshot
                             if (feat->ne[0] > target_res) {
                                 int excess = feat->ne[0] - target_res + 1;
