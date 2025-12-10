@@ -718,7 +718,11 @@ struct clip_graph {
         if (same_spatial && same_channel) {
             if (block.layer_scale_w) {
                 ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
-                scaled = ggml_mul(ctx0, scaled, block.layer_scale_w);
+                // Reshape layer_scale_w to match permuted dimensions
+                // scaled is [C, W, H, B], layer_scale_w needs to be [1, scale_dim, 1, 1] for broadcasting
+                ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
+                    1, block.layer_scale_w->ne[0], 1, 1);
+                scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
                 cur = ggml_cont(ctx0, cur);
             }
@@ -794,7 +798,10 @@ struct clip_graph {
                 // layer_scale_w is [C], cur is [W, H, C, B]
                 // Permute to [C, W, H, B], apply scale, permute back
                 ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
-                scaled = ggml_mul(ctx0, scaled, block.layer_scale_w);
+                // Reshape layer_scale_w to match permuted dimensions for broadcasting
+                ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
+                    1, block.layer_scale_w->ne[0], 1, 1);
+                scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
                 cur = ggml_cont(ctx0, cur);
             }
