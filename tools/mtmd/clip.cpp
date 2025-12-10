@@ -811,21 +811,22 @@ struct clip_graph {
         v = ggml_cont(ctx0, v);
 
         // Step 4: Broadcast V to all heads: [M, D, 1, B] -> [M, D, n_head, B]
-        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, scores);
+        // Use k_broadcast as template since it has [D, M, n_head, B], we need [M, D, n_head, B]
+        // Create proper target by permuting k_broadcast shape
+        ggml_tensor * v_target = ggml_permute(ctx0, k_broadcast, 1, 0, 2, 3); // [M, D, n_head, B]
+        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, v_target);
 
         // Step 5: Compute attn @ V -> output
-        // scores: [N, M, n_head, B], v_broadcast: [M, D, n_head, B]
-        // Result: [N, D, n_head, B]
+        // scores: [M, N, n_head, B], v_broadcast: [M, D, n_head, B]
+        // Result: [D, N, n_head, B]
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v_broadcast, scores);
 
-        // Permute to [D, N, n_head, B] for output reshaping
-        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3);
-        kqv = ggml_cont(ctx0, kqv);
-
         // --- Reshape back to spatial layout ---
-        // kqv: [D, N, n_head, B] -> [W, H, D*n_head, B]
+        // kqv is already [D, N, n_head, B], reshape to [N, D, n_head, B] then to spatial
         kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3);            // [N, D, n_head, B]
-        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D*n_head, B);  // [W, H, D*n_head, B]
+        kqv = ggml_cont(ctx0, kqv);
+        kqv = ggml_reshape_3d(ctx0, kqv, N, D * n_head, B);  // [N, D*n_head, B]
+        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D * n_head, B); // [W, H, D*n_head, B]
         kqv = ggml_cont(ctx0, kqv);
 
         // Output projection
