@@ -768,6 +768,7 @@ struct clip_graph {
         const int W = cur->ne[0]; const int H = cur->ne[1]; const int B = cur->ne[3];
         const int D = k->ne[2]; // Head dimension (single head for K/V in MQA)
         const int n_head = q->ne[2] / D;
+        const int N = W * H; // Number of query positions
 
         // Process Q: [W, H, D*n_head, B] -> [D, N, n_head, B]
         q = ggml_reshape_3d(ctx0, q, W*H, D*n_head, B);        // [N, D*n_head, B]
