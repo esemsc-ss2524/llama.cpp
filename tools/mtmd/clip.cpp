@@ -777,13 +777,13 @@ struct clip_graph {
         k = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, k, D, Wk*Hk, B), D, 1, Wk*Hk, B), 0, 2, 1, 3);
         k = ggml_cont(ctx0, k); // [D, M, 1, B]
 
-        v = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, v, D, Wk*Hk, B), D, 1, Wk*Hk, B), 0, 2, 1, 3);
-        v = ggml_cont(ctx0, v); // [D, M, 1, B]
+        v = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, v, D, Wk*Hk, B), D, 1, Wk*Hk, B), 2, 0, 1, 3);
+        v = ggml_cont(ctx0, v); // [M, D, 1, B] - M contracts with kq's M dimension
 
         float scale = 1.0f / sqrtf((float)D);
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q); // [M, N]
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q); // [M, N, n_head, B]
         kq = ggml_soft_max_ext(ctx0, kq, nullptr, scale, 0.0f);
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq); // [D, N]
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq); // [D, N, n_head, B] (v^T @ kq)
 
         kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3); // [D, n_head, N, B]
         kqv = ggml_reshape_4d(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ggml_cont(ctx0, kqv), D*n_head, W*H, B), 1, 0, 2, 3), W, H, D*n_head, B);
