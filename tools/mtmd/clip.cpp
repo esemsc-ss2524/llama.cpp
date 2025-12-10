@@ -733,72 +733,99 @@ struct clip_graph {
     }
 
     // ------------------------------------------------------------------------
-    // MobileNet Multi-Query Attention (MQA)
+    // MobileNet Multi-Query Attention (MQA) - Corrected
     // ------------------------------------------------------------------------
     ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block) {
         ggml_tensor * cur = inp;
-        
+
         if (block.attn_norm_w) cur = rms_norm_2d(cur, block.attn_norm_w);
 
-        // Q [W, H, C, B] -> [W, H, D*Hds, B] (1x1)
-        // ggml_tensor* q_w = fix_1x1_weight(block.attn_q_w);
-        // ggml_tensor * q = ggml_conv_2d(ctx0, q_w, cur, 1, 1, 0, 0, 1, 1);
+        // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
-        
-        // K Downsampling & Conv
+
+        // 2. K Calculation (Downsampled)
         ggml_tensor * k_inp = cur;
         if (block.attn_k_dw_w) {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_k_norm_w) k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
         }
-        // ggml_tensor* k_w = fix_1x1_weight(block.attn_k_w);
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
-        // V Downsampling & Conv
+        // 3. V Calculation (Downsampled)
         ggml_tensor * v_inp = cur;
         if (block.attn_v_dw_w) {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_v_norm_w) v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
         }
-        // ggml_tensor* v_w = fix_1x1_weight(block.attn_v_w);
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
-        // ... (Reshape for attention - Same as before) ...
+        // --- Reshape & Permute Logic (Corrected for memory layout) ---
+        // Conv2d output layout: [W, H, C, B] where W is fastest dimension
+        // Collapse spatial dimensions (W*H) first to respect memory layout
+
         const int W = cur->ne[0]; const int H = cur->ne[1]; const int B = cur->ne[3];
-        const int D = k->ne[2]; // Head Dim
+        const int D = k->ne[2]; // Head dimension (single head for K/V in MQA)
         const int n_head = q->ne[2] / D;
-        
-        q = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, q, D*n_head, W*H, B), D, n_head, W*H, B), 0, 2, 1, 3);
-        q = ggml_cont(ctx0, q); // [D, N, n_head, B]
+
+        // Process Q: [W, H, D*n_head, B] -> [D, N, n_head, B]
+        q = ggml_reshape_3d(ctx0, q, W*H, D*n_head, B);        // [N, D*n_head, B]
+        q = ggml_reshape_4d(ctx0, q, W*H, D, n_head, B);       // [N, D, n_head, B]
+        q = ggml_permute(ctx0, q, 1, 0, 2, 3);                 // [D, N, n_head, B]
+        q = ggml_cont(ctx0, q);
 
         const int Wk = k->ne[0]; const int Hk = k->ne[1];
-        k = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, k, D, Wk*Hk, B), D, 1, Wk*Hk, B), 0, 2, 1, 3);
-        k = ggml_cont(ctx0, k); // [D, M, 1, B]
+        const int M = Wk * Hk; // Number of key/value tokens
 
-        v = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_reshape_3d(ctx0, v, D, Wk*Hk, B), D, 1, Wk*Hk, B), 2, 0, 1, 3);
-        v = ggml_cont(ctx0, v); // [M, D, 1, B] - M contracts with kq's M dimension
+        // Process K: [Wk, Hk, D, B] -> [D, M, 1, B]
+        k = ggml_reshape_3d(ctx0, k, M, D, B);                 // [M, D, B]
+        k = ggml_reshape_4d(ctx0, k, M, D, 1, B);              // [M, D, 1, B]
+        k = ggml_permute(ctx0, k, 1, 0, 2, 3);                 // [D, M, 1, B]
+        k = ggml_cont(ctx0, k);
 
+        // Process V: [Wk, Hk, D, B] -> [M, D, 1, B]
+        v = ggml_reshape_3d(ctx0, v, M, D, B);                 // [M, D, B]
+        v = ggml_reshape_4d(ctx0, v, M, D, 1, B);              // [M, D, 1, B]
+        v = ggml_cont(ctx0, v);                                 // Keep as [M, D, 1, B]
+
+        // --- Multi-Query Attention with Explicit Broadcasting ---
         float scale = 1.0f / sqrtf((float)D);
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q); // [M, N, n_head, B]
+
+        // Broadcast K to match Q's multi-head structure
+        // k: [D, M, 1, B] -> k_rep: [D, M, n_head, B]
+        ggml_tensor * k_rep = ggml_repeat(ctx0, k, q);
+
+        // Compute attention weights: kq = k_rep^T @ q
+        // k_rep: [D, M, n_head, B], q: [D, N, n_head, B] -> kq: [M, N, n_head, B]
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k_rep, q);
         kq = ggml_soft_max_ext(ctx0, kq, nullptr, scale, 0.0f);
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq); // [D, N, n_head, B] (v^T @ kq)
 
-        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3); // [D, n_head, N, B]
-        kqv = ggml_reshape_4d(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ggml_cont(ctx0, kqv), D*n_head, W*H, B), 1, 0, 2, 3), W, H, D*n_head, B);
+        // Broadcast V to match kq's multi-head structure
+        // v: [M, D, 1, B] -> v_rep: [M, D, n_head, B]
+        ggml_tensor * v_rep = v;
+        if (n_head > 1) {
+            // Create a target tensor with the desired shape for broadcasting
+            v_rep = ggml_repeat(ctx0, v, kq);  // Use kq as shape template
+        }
 
-        // Output projection 1x1
-        // ggml_tensor* o_w = fix_1x1_weight(block.attn_o_w);
+        // Compute attention output: kqv = v_rep^T @ kq
+        // v_rep: [M, D, n_head, B], kq: [M, N, n_head, B] -> kqv: [D, N, n_head, B]
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_rep, kq);
+
+        // --- Reshape back to spatial layout ---
+        // kqv: [D, N, n_head, B] -> [W, H, D*n_head, B]
+        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3);            // [N, D, n_head, B]
+        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D*n_head, B);  // [W, H, D*n_head, B]
+        kqv = ggml_cont(ctx0, kqv);
+
+        // Output projection
         cur = ggml_conv_2d(ctx0, block.attn_o_w, kqv, 1, 1, 0, 0, 1, 1);
 
         // Apply layer_scale and residual connection
         if (inp->ne[0] == cur->ne[0] && inp->ne[2] == cur->ne[2]) {
             if (block.layer_scale_w) {
-                // layer_scale_w is [C], cur is [W, H, C, B]
-                // Permute to [C, W, H, B], apply scale, permute back
                 ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
-                // Reshape layer_scale_w to match permuted dimensions for broadcasting
                 ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
                     1, block.layer_scale_w->ne[0], 1, 1);
                 scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
