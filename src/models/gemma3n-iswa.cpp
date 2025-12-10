@@ -259,7 +259,19 @@ ggml_tensor * llm_build_gemma3n_iswa::get_per_layer_inputs() {
         inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float) n_embd_altup));
         cb(inp_per_layer, "inp_per_layer_selected", -1);
     } else {
-        GGML_ABORT("TODO: support embd input");
+        // For embedding inputs (e.g., from vision encoder)
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+
+        // Project embeddings to per-layer space using per_layer_model_proj
+        // This is similar to what project_per_layer_inputs does
+        const float per_layer_projection_scale = 1.0f / sqrtf((float) n_embd);
+
+        inp_per_layer = ggml_mul_mat(ctx0, model.per_layer_model_proj, inp->embd);
+        inp_per_layer = ggml_scale(ctx0, inp_per_layer, per_layer_projection_scale);
+        inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_altup, n_layer, n_tokens);
+        inp_per_layer = build_norm(inp_per_layer, model.per_layer_proj_norm, NULL, LLM_NORM_RMS, -1);
+        cb(inp_per_layer, "inp_per_layer_from_embd", -1);
     }
     res->add_input(std::move(inp));
     return inp_per_layer;
