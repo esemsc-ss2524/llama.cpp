@@ -927,13 +927,38 @@ struct clip_graph {
             std::vector<ggml_tensor*> resized_feats;
 
             for (auto feat : intermediate_features) {
-                if (feat->ne[0] != target_res) {
-                    if (feat->ne[0] > target_res) {
-                        int s = feat->ne[0] / target_res;
+                int feat_res = feat->ne[0];
+                if (feat_res != target_res) {
+                    // Check if we can use simple pooling (integer scale)
+                    if (feat_res > target_res && feat_res % target_res == 0) {
+                        // Integer downsampling with pooling
+                        int s = feat_res / target_res;
                         feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
+                    } else if (feat_res < target_res && target_res % feat_res == 0) {
+                        // Integer upsampling
+                        int s = target_res / feat_res;
+                        feat = ggml_upscale(ctx0, feat, s);
                     } else {
-                        int s = target_res / feat->ne[0];
-                        feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_BILINEAR);
+                        // Non-integer scale - use interpolation
+                        // For now, use adaptive pooling by calculating proper kernel/stride
+                        if (feat_res > target_res) {
+                            // Downsampling: calculate kernel size for desired output
+                            // output = (input - kernel) / stride + 1
+                            // We want output = target_res, so: kernel = input - (target_res - 1) * stride
+                            // Using stride = 1 for simplicity: kernel = input - target_res + 1
+                            int kernel = feat_res - target_res + 1;
+                            feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, kernel, kernel, 1, 1, 0, 0);
+                        } else {
+                            // Upsampling: use nearest neighbor scaling
+                            // Calculate scale as close integer approximation
+                            int s = (target_res + feat_res - 1) / feat_res;
+                            feat = ggml_upscale(ctx0, feat, s);
+                            // May need additional pooling if overshot
+                            if (feat->ne[0] > target_res) {
+                                int excess = feat->ne[0] - target_res + 1;
+                                feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, excess, excess, 1, 1, 0, 0);
+                            }
+                        }
                     }
                 }
                 resized_feats.push_back(feat);
