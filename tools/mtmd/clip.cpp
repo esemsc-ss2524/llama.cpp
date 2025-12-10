@@ -993,6 +993,7 @@ struct clip_graph {
         int B = cur->ne[3];
         
         cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
+        cur = ggml_cont(ctx0, cur);
         cur = ggml_reshape_3d(ctx0, cur, C, W*H, B);
         cur = ggml_cont(ctx0, cur); 
 
