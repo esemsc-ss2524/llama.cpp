@@ -596,24 +596,42 @@ struct clip_graph {
     // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
     ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f) {
         // inp: [W, H, C, B]
-        // Permute to [C, W, H, B]
-        ggml_tensor * cur = ggml_permute(ctx0, inp, 2, 0, 1, 3);
+        const int64_t W = inp->ne[0];
+        const int64_t H = inp->ne[1];
+        const int64_t C = inp->ne[2];
+        const int64_t B = inp->ne[3];
+
+        // Flatten spatial dimensions: [W, H, C, B] -> [W*H, C, B]
+        ggml_tensor * cur = ggml_reshape_3d(ctx0, inp, W * H, C, B);
+
+        // Permute to [C, W*H, B]
+        cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
         cur = ggml_cont(ctx0, cur);
-        
+
+        // Reshape to [C, W*H*B] for RMS norm
+        cur = ggml_reshape_2d(ctx0, cur, C, W * H * B);
+
         // Apply RMS Norm (normalizes first dimension C)
         cur = ggml_rms_norm(ctx0, cur, eps);
-        
+
         // Apply weight (Scale)
         if (weight) {
-            // weight is {C, 1, 1, 1}
-            // cur is {C, W, H, B}
-            // ggml_mul broadcasts 1s in weight to match W, H, B
+            // weight is [C], cur is [C, W*H*B]
+            // ggml_mul will broadcast along the second dimension
             cur = ggml_mul(ctx0, cur, weight);
         }
 
-        // Permute back to [W, H, C, B]
-        cur = ggml_permute(ctx0, cur, 1, 2, 0, 3);
-        return ggml_cont(ctx0, cur);
+        // Reshape back to [C, W*H, B]
+        cur = ggml_reshape_3d(ctx0, cur, C, W * H, B);
+
+        // Permute to [W*H, C, B]
+        cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
+        cur = ggml_cont(ctx0, cur);
+
+        // Reshape to [W, H, C, B]
+        cur = ggml_reshape_4d(ctx0, cur, W, H, C, B);
+
+        return cur;
     }
 
 
@@ -642,8 +660,9 @@ struct clip_graph {
         cur = ggml_gelu(ctx0, cur);
 
         // 2. Pointwise Linear Conv (1x1) - Needs Fix
-        ggml_tensor* pwl_w = fix_1x1_weight(block.s0_conv_pwl_w);
-        cur = ggml_conv_2d(ctx0, pwl_w, cur, 1, 1, 0, 0, 1, 1);
+        // ggml_tensor* pwl_w = fix_1x1_weight(block.s0_conv_pwl_w);
+        // cur = ggml_conv_2d(ctx0, pwl_w, cur, 1, 1, 0, 0, 1, 1);
+        cur = ggml_conv_2d(ctx0, block.s0_conv_pwl_w, cur, 1, 1, 0, 0, 1, 1);
         if (block.s0_bn2_w) cur = rms_norm_2d(cur, block.s0_bn2_w);
 
         // 3. Residual
@@ -670,8 +689,8 @@ struct clip_graph {
 
         // 2. Pointwise Expansion (1x1) - Needs Fix
         if (block.pw_exp_w) {
-            ggml_tensor* exp_w = fix_1x1_weight(block.pw_exp_w);
-            cur = ggml_conv_2d(ctx0, exp_w, cur, 1, 1, 0, 0, 1, 1);
+            // ggml_tensor* exp_w = fix_1x1_weight(block.pw_exp_w);
+            cur = ggml_conv_2d(ctx0, block.pw_exp_w, cur, 1, 1, 0, 0, 1, 1);
             if (block.pw_exp_bn_w) cur = rms_norm_2d(cur, block.pw_exp_bn_w);
             cur = ggml_gelu(ctx0, cur);
         }
@@ -687,8 +706,8 @@ struct clip_graph {
 
         // 4. Pointwise Projection (1x1) - Needs Fix
         if (block.pw_proj_w) {
-            ggml_tensor* proj_w = fix_1x1_weight(block.pw_proj_w);
-            cur = ggml_conv_2d(ctx0, proj_w, cur, 1, 1, 0, 0, 1, 1);
+            // ggml_tensor* proj_w = fix_1x1_weight(block.pw_proj_w);
+            cur = ggml_conv_2d(ctx0, block.pw_proj_w, cur, 1, 1, 0, 0, 1, 1);
             if (block.pw_proj_bn_w) cur = rms_norm_2d(cur, block.pw_proj_bn_w);
         }
 
@@ -718,8 +737,9 @@ struct clip_graph {
         if (block.attn_norm_w) cur = rms_norm_2d(cur, block.attn_norm_w);
 
         // Q [W, H, C, B] -> [W, H, D*Hds, B] (1x1)
-        ggml_tensor* q_w = fix_1x1_weight(block.attn_q_w);
-        ggml_tensor * q = ggml_conv_2d(ctx0, q_w, cur, 1, 1, 0, 0, 1, 1);
+        // ggml_tensor* q_w = fix_1x1_weight(block.attn_q_w);
+        // ggml_tensor * q = ggml_conv_2d(ctx0, q_w, cur, 1, 1, 0, 0, 1, 1);
+        ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
         
         // K Downsampling & Conv
         ggml_tensor * k_inp = cur;
@@ -728,8 +748,8 @@ struct clip_graph {
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_k_norm_w) k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
         }
-        ggml_tensor* k_w = fix_1x1_weight(block.attn_k_w);
-        ggml_tensor * k = ggml_conv_2d(ctx0, k_w, k_inp, 1, 1, 0, 0, 1, 1);
+        // ggml_tensor* k_w = fix_1x1_weight(block.attn_k_w);
+        ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
         // V Downsampling & Conv
         ggml_tensor * v_inp = cur;
@@ -738,8 +758,8 @@ struct clip_graph {
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_v_norm_w) v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
         }
-        ggml_tensor* v_w = fix_1x1_weight(block.attn_v_w);
-        ggml_tensor * v = ggml_conv_2d(ctx0, v_w, v_inp, 1, 1, 0, 0, 1, 1);
+        // ggml_tensor* v_w = fix_1x1_weight(block.attn_v_w);
+        ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
         // ... (Reshape for attention - Same as before) ...
         const int W = cur->ne[0]; const int H = cur->ne[1]; const int B = cur->ne[3];
@@ -765,8 +785,8 @@ struct clip_graph {
         kqv = ggml_reshape_4d(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ggml_cont(ctx0, kqv), D*n_head, W*H, B), 1, 0, 2, 3), W, H, D*n_head, B);
 
         // Output projection 1x1
-        ggml_tensor* o_w = fix_1x1_weight(block.attn_o_w);
-        cur = ggml_conv_2d(ctx0, o_w, kqv, 1, 1, 0, 0, 1, 1);
+        // ggml_tensor* o_w = fix_1x1_weight(block.attn_o_w);
+        cur = ggml_conv_2d(ctx0, block.attn_o_w, kqv, 1, 1, 0, 0, 1, 1);
 
         // Apply layer_scale and residual connection
         if (inp->ne[0] == cur->ne[0] && inp->ne[2] == cur->ne[2]) {
@@ -877,14 +897,14 @@ struct clip_graph {
 
             // Expansion
             if (model.msfa_ffn_expand_w) {
-                ggml_tensor* exp_w = fix_1x1_weight(model.msfa_ffn_expand_w);
-                cur = ggml_conv_2d(ctx0, exp_w, cur, 1, 1, 0, 0, 1, 1);
+                // ggml_tensor* exp_w = fix_1x1_weight(model.msfa_ffn_expand_w);
+                cur = ggml_conv_2d(ctx0, model.msfa_ffn_expand_w, cur, 1, 1, 0, 0, 1, 1);
                 cur = ggml_gelu(ctx0, cur);
             }
             // Projection
             if (model.msfa_ffn_project_w) {
-                ggml_tensor* proj_w = fix_1x1_weight(model.msfa_ffn_project_w);
-                cur = ggml_conv_2d(ctx0, proj_w, cur, 1, 1, 0, 0, 1, 1);
+                // ggml_tensor* proj_w = fix_1x1_weight(model.msfa_ffn_project_w);
+                cur = ggml_conv_2d(ctx0, model.msfa_ffn_project_w, cur, 1, 1, 0, 0, 1, 1);
             }
             // Norm
             if (model.msfa_concat_norm_w) cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
