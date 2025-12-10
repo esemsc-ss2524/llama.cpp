@@ -1,0 +1,86 @@
+# GDB Commands for Debugging MobileNetV5
+# Save this file and load with: gdb -x gdb_commands.txt
+
+# Skip irrelevant exceptions from template library
+skip -rfu .*minja.*
+skip -rfu .*jinja.*
+
+# Break at key points in MobileNetV5
+break clip_graph::build_mobilenetv5
+break clip_graph::rms_norm_2d
+break clip_graph::build_edge_residual
+break clip_graph::build_inverted_residual
+break clip_graph::build_mobilenet_attn
+
+# Break at GGML assertion failures
+break ggml_abort
+
+# Catch C++ exceptions and print details
+catch throw
+commands
+  silent
+  printf "Exception thrown: "
+  call (void)__cxa_current_exception_type()->name()
+  printf "\n"
+  # Try to print the what() message if it's std::exception
+  python
+try:
+    import gdb
+    exc = gdb.parse_and_eval("(std::exception*)__cxa_current_exception_type()")
+    print("Message:", exc['what']())
+except:
+    pass
+end
+  continue
+end
+
+# Define custom command to print tensor info
+define ptensor
+  if $argc == 0
+    help ptensor
+  else
+    printf "Tensor: %s\n", "$arg0"
+    printf "  Type: %d\n", $arg0->type
+    printf "  Dims: [%lld, %lld, %lld, %lld]\n", $arg0->ne[0], $arg0->ne[1], $arg0->ne[2], $arg0->ne[3]
+    printf "  Data: %p\n", $arg0->data
+  end
+end
+
+document ptensor
+Print tensor information
+Usage: ptensor <tensor_variable>
+Example: ptensor cur
+end
+
+# Define custom command to compare tensor shapes
+define tshape_eq
+  if $argc != 2
+    help tshape_eq
+  else
+    if $arg0->ne[0] == $arg1->ne[0] && $arg0->ne[1] == $arg1->ne[1] && $arg0->ne[2] == $arg1->ne[2] && $arg0->ne[3] == $arg1->ne[3]
+      printf "Shapes MATCH: [%lld, %lld, %lld, %lld]\n", $arg0->ne[0], $arg0->ne[1], $arg0->ne[2], $arg0->ne[3]
+    else
+      printf "Shapes MISMATCH!\n"
+      printf "  %s: [%lld, %lld, %lld, %lld]\n", "$arg0", $arg0->ne[0], $arg0->ne[1], $arg0->ne[2], $arg0->ne[3]
+      printf "  %s: [%lld, %lld, %lld, %lld]\n", "$arg1", $arg1->ne[0], $arg1->ne[1], $arg1->ne[2], $arg1->ne[3]
+    end
+  end
+end
+
+document tshape_eq
+Compare shapes of two tensors
+Usage: tshape_eq <tensor1> <tensor2>
+Example: tshape_eq inp cur
+end
+
+# Auto-continue through minja exceptions
+set breakpoint pending on
+set pagination off
+set print pretty on
+
+# Show where we are when we stop
+set print frame-arguments all
+
+printf "GDB commands loaded for MobileNetV5 debugging\n"
+printf "Use 'ptensor <var>' to inspect tensor shapes\n"
+printf "Use 'tshape_eq <var1> <var2>' to compare shapes\n"

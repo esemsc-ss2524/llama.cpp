@@ -2,6 +2,8 @@
 
 ## Quick Start
 
+### Method 1: VSCode Debugger (Recommended)
+
 1. **Open the project in VSCode**: `code /home/user/llama.cpp`
 
 2. **Set breakpoints** in `tools/mtmd/clip.cpp`:
@@ -14,7 +16,20 @@
 
 3. **Start debugging**:
    - Press `F5` or click "Run and Debug" in the sidebar
-   - Select "Debug llama-server" or "Debug llama-cli"
+   - Select **"Debug MobileNetV5 (Direct Breakpoint)"** - This skips minja exceptions!
+   - Alternative: "Debug llama-server" or "Debug llama-cli"
+
+### Method 2: Command Line GDB (Faster)
+
+```bash
+./debug_vision.sh <model.gguf> <vision.gguf> [optional-image.jpg]
+```
+
+This script:
+- Automatically skips irrelevant minja exceptions
+- Sets breakpoints at key MobileNetV5 functions
+- Forces single-threaded execution
+- Provides custom commands like `ptensor <var>`
 
 ## Single-Threaded Debugging (Easier!)
 
@@ -131,7 +146,48 @@ Or use the VSCode task: `Ctrl+Shift+B` → "Compile Debug"
 Debug builds are MUCH slower than release builds. Use them only for debugging,
 not for actual inference.
 
+## Handling Minja/Template Exceptions
+
+The minja template library (used for chat templates) may throw exceptions during initialization. These are **usually harmless** and unrelated to the vision encoder.
+
+### How to Skip Them:
+
+**In VSCode:**
+- Use the **"Debug MobileNetV5 (Direct Breakpoint)"** configuration
+- It automatically skips minja exceptions with: `skip -rfu .*minja.*`
+
+**In GDB manually:**
+```gdb
+skip -rfu .*minja.*
+skip -rfu .*jinja.*
+catch throw
+commands
+  silent
+  # Check backtrace and continue if it's minja
+  backtrace 1
+  if $_regex($_streq, ".*minja.*") == 1
+    continue
+  end
+end
+```
+
+**When an exception is actually important:**
+- Check the **backtrace** (`bt`)
+- Look for functions with **ggml**, **clip**, or **mobilenet** in the name
+- If it's all minja/template code, just press `c` to continue
+
+### Using the Debug Script:
+
+The `debug_vision.sh` script handles this automatically:
+```bash
+./debug_vision.sh model.gguf vision.gguf
+# Will skip minja and break at build_mobilenetv5()
+```
+
 ## Troubleshooting
+
+**Problem**: Exception in minja.hpp before reaching vision code
+- **Solution**: This is normal! Use "Debug MobileNetV5 (Direct Breakpoint)" or press `c` to continue
 
 **Problem**: Breakpoints not hitting
 - **Solution**: Make sure you built with `-DCMAKE_BUILD_TYPE=Debug`
@@ -141,3 +197,6 @@ not for actual inference.
 
 **Problem**: Too many threads make debugging confusing
 - **Solution**: The configs already use `-t 1`, but you can also add `OMP_NUM_THREADS=1`
+
+**Problem**: Want to see the actual error message when exception is thrown
+- **Solution**: In Debug Console, type: `-exec info exception` then `c` to see what was thrown
