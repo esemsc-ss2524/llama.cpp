@@ -5142,6 +5142,12 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 int scale_factor = ctx->model.hparams.n_merge;
                 n_patches /= (scale_factor * scale_factor);
             } break;
+        case PROJECTOR_TYPE_GEMMA3N:
+            {
+                // MobileNetV5 MSFA adapter always outputs fixed 16x16 resolution
+                // regardless of input size (see architecture description)
+                n_patches = 16 * 16;  // 256 tokens
+            } break;
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_KIMIVL:
             {
