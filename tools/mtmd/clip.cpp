@@ -23,6 +23,8 @@
 #include <limits>
 #include <array>
 #include <functional>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
@@ -650,11 +652,11 @@ struct clip_graph {
     // ------------------------------------------------------------------------
     // Edge Residual Block (Stage 0)
     // ------------------------------------------------------------------------
-    ggml_tensor * build_edge_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride) {
+    ggml_tensor * build_edge_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride, int block_idx = -1) {
         ggml_tensor * cur = inp;
-        
+
         // 1. Expansion Conv (3x3) - Already correct shape {3, 3, Cin, Cout}
-        int pad = 1; 
+        int pad = 1;
         cur = ggml_conv_2d(ctx0, block.s0_conv_exp_w, cur, stride, stride, pad, pad, 1, 1);
         if (block.s0_bn1_w) cur = rms_norm_2d(cur, block.s0_bn1_w);
         cur = ggml_gelu(ctx0, cur);
@@ -669,14 +671,21 @@ struct clip_graph {
         if (stride == 1 && inp->ne[2] == cur->ne[2] && inp->ne[0] == cur->ne[0]) {
             cur = ggml_add(ctx0, cur, inp);
         }
-        
+
+        // Name tensor for debugging
+        if (block_idx >= 0) {
+            char name[128];
+            snprintf(name, sizeof(name), "mobilenet_block_%d_edge_residual", block_idx);
+            ggml_set_name(cur, name);
+        }
+
         return cur;
     }
 
     // ------------------------------------------------------------------------
     // Universal Inverted Residual Block (Stage 1+)
     // ------------------------------------------------------------------------
-    ggml_tensor * build_inverted_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride) {
+    ggml_tensor * build_inverted_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride, int block_idx = -1) {
         ggml_tensor * cur = inp;
 
         // 1. Depthwise Start (Optional)
@@ -724,10 +733,25 @@ struct clip_graph {
                 ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
                     1, block.layer_scale_w->ne[0], 1, 1);
                 scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
+
+                // Name layer_scale output for debugging
+                if (block_idx >= 0) {
+                    char name[128];
+                    snprintf(name, sizeof(name), "mobilenet_block_%d_layer_scale", block_idx);
+                    ggml_set_name(scaled, name);
+                }
+
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
                 cur = ggml_cont(ctx0, cur);
             }
             cur = ggml_add(ctx0, cur, inp);
+        }
+
+        // Name tensor for debugging
+        if (block_idx >= 0) {
+            char name[128];
+            snprintf(name, sizeof(name), "mobilenet_block_%d_inverted_residual", block_idx);
+            ggml_set_name(cur, name);
         }
 
         return cur;
@@ -736,10 +760,18 @@ struct clip_graph {
     // ------------------------------------------------------------------------
     // MobileNet Multi-Query Attention (MQA) - Corrected
     // ------------------------------------------------------------------------
-    ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block) {
+    ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block, int block_idx = -1) {
         ggml_tensor * cur = inp;
 
-        if (block.attn_norm_w) cur = rms_norm_2d(cur, block.attn_norm_w);
+        if (block.attn_norm_w) {
+            cur = rms_norm_2d(cur, block.attn_norm_w);
+            // Name norm output for debugging
+            if (block_idx >= 0) {
+                char name[128];
+                snprintf(name, sizeof(name), "mobilenet_block_%d_attn_norm", block_idx);
+                ggml_set_name(cur, name);
+            }
+        }
 
         // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
@@ -749,7 +781,15 @@ struct clip_graph {
         if (block.attn_k_dw_w) {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
-            if (block.attn_k_norm_w) k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
+            if (block.attn_k_norm_w) {
+                k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
+                // Name key norm for debugging
+                if (block_idx >= 0) {
+                    char name[128];
+                    snprintf(name, sizeof(name), "mobilenet_block_%d_attn_key_norm", block_idx);
+                    ggml_set_name(k_inp, name);
+                }
+            }
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
@@ -758,7 +798,15 @@ struct clip_graph {
         if (block.attn_v_dw_w) {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
-            if (block.attn_v_norm_w) v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+            if (block.attn_v_norm_w) {
+                v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+                // Name value norm for debugging
+                if (block_idx >= 0) {
+                    char name[128];
+                    snprintf(name, sizeof(name), "mobilenet_block_%d_attn_value_norm", block_idx);
+                    ggml_set_name(v_inp, name);
+                }
+            }
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
@@ -850,6 +898,14 @@ struct clip_graph {
             }
             cur = ggml_add(ctx0, cur, inp);
         }
+
+        // Name tensor for debugging
+        if (block_idx >= 0) {
+            char name[128];
+            snprintf(name, sizeof(name), "mobilenet_block_%d_attn_output", block_idx);
+            ggml_set_name(cur, name);
+        }
+
         return cur;
     }
 
@@ -883,7 +939,8 @@ struct clip_graph {
         }
         if (model.mobilenet_stem_norm_w) cur = rms_norm_2d(cur, model.mobilenet_stem_norm_w);
         cur = ggml_gelu(ctx0, cur);
-        
+        ggml_set_name(cur, "mobilenet_stem_output");
+
         DEBUG_SHAPE("After Stem", cur);
 
         // 2. Blocks
@@ -912,9 +969,9 @@ struct clip_graph {
             const auto & block = model.mobilenet_blocks[i];
             int stride = is_stage_start(i) ? 2 : 1;
 
-            if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride);
-            else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block);
-            else                          cur = build_inverted_residual(cur, block, stride);
+            if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride, i);
+            else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block, i);
+            else                          cur = build_inverted_residual(cur, block, stride, i);
 
             if (is_fusion_point(i)) {
                 fprintf(stderr, "DEBUG: Collecting fusion feature at block index %d\n", i);
@@ -948,22 +1005,25 @@ struct clip_graph {
             // C. Concatenate at High Resolution
             cur = resized_feats[0];
             for (size_t k = 1; k < resized_feats.size(); ++k) {
-                cur = ggml_concat(ctx0, cur, resized_feats[k], 2); 
+                cur = ggml_concat(ctx0, cur, resized_feats[k], 2);
             }
+            ggml_set_name(cur, "msfa_concat");
 
             // D. Apply FFN (Conv blocks) at High Resolution
             if (model.msfa_ffn_expand_w) {
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_expand_w, cur, 1, 1, 0, 0, 1, 1);
                 cur = ggml_gelu(ctx0, cur);
+                ggml_set_name(cur, "msfa_ffn_expand");
             }
             if (model.msfa_ffn_project_w) {
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_project_w, cur, 1, 1, 0, 0, 1, 1);
+                ggml_set_name(cur, "msfa_ffn_project");
             }
 
             // E. Final Downsample to Target Resolution (16x16)
             const int target_res = 16;
             int current_res = cur->ne[0];
-            
+
             if (current_res > target_res) {
                 // Average Pool down to 16x16
                 // Calculate stride/kernel needed
@@ -971,10 +1031,14 @@ struct clip_graph {
                 int s = current_res / target_res;
                 // Padding is usually 0 here for integer downsampling
                 cur = ggml_pool_2d(ctx0, cur, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
+                ggml_set_name(cur, "msfa_downsample");
             }
 
             // F. Final Norm
-            if (model.msfa_concat_norm_w) cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
+            if (model.msfa_concat_norm_w) {
+                cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
+                ggml_set_name(cur, "msfa_concat_norm");
+            }
         }
 
         // ... (Keep existing projection section) ...
@@ -983,21 +1047,23 @@ struct clip_graph {
         int H = cur->ne[1];
         int C = cur->ne[2];
         int B = cur->ne[3];
-        
+
         cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
         cur = ggml_cont(ctx0, cur);
         cur = ggml_reshape_3d(ctx0, cur, C, W*H, B);
-        cur = ggml_cont(ctx0, cur); 
+        cur = ggml_cont(ctx0, cur);
 
         if (model.mm_input_proj_w) {
             cur = ggml_mul_mat(ctx0, model.mm_input_proj_w, cur);
+            ggml_set_name(cur, "mm_input_proj");
         }
 
         if (model.mm_soft_emb_norm_w) {
             cur = ggml_rms_norm(ctx0, cur, eps);
             cur = ggml_mul(ctx0, cur, model.mm_soft_emb_norm_w);
+            ggml_set_name(cur, "mm_soft_emb_norm");
         }
-        
+
         ggml_build_forward_expand(gf, cur);
         return gf;
     }
@@ -5577,6 +5643,47 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             print_tensor_shape(t);
             print_tensor_data(t, data.data(), 3);
         }
+    }
+
+    // Save intermediate tensors to .npy files for debugging (Gemma 3n Vision)
+    // Set environment variable CLIP_DEBUG_SAVE_TENSORS=1 to enable
+    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+        const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
+        std::string output_path = output_dir ? output_dir : "debug_ggml_output";
+
+        // Create output directory if it doesn't exist
+        #ifdef _WIN32
+        _mkdir(output_path.c_str());
+        #else
+        mkdir(output_path.c_str(), 0755);
+        #endif
+
+        LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
+
+        // Iterate through all nodes in the graph and save named tensors
+        for (int i = 0; i < gf->n_nodes; i++) {
+            ggml_tensor * node = gf->nodes[i];
+            if (node->name && strlen(node->name) > 0) {
+                // Save tensors that match our naming patterns
+                std::string name_str(node->name);
+                bool should_save = (
+                    name_str.find("mobilenet_") != std::string::npos ||
+                    name_str.find("msfa_") != std::string::npos ||
+                    name_str.find("mm_") != std::string::npos ||
+                    name_str == "inp_raw"
+                );
+
+                if (should_save) {
+                    std::string filepath = output_path + "/debug_" + name_str + ".npy";
+                    // Get backend for this tensor
+                    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), node);
+                    save_tensor_to_npy(node, filepath, backend);
+                }
+            }
+        }
+
+        LOG_INF("=== Tensor saving complete ===\n\n");
     }
 
     // the last node is the embedding tensor
