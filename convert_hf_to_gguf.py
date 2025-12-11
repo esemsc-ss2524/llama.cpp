@@ -6062,6 +6062,36 @@ class Gemma3nVisionModel(MmprojModel):
         return super().find_vparam(keys, optional)
 
     def set_gguf_parameters(self):
+        # MobileNetV5 requires ImageNet normalization values
+        # Override preprocessor_config to ensure correct values before calling super()
+        # IMAGENET_MEAN = [0.485, 0.456, 0.406]
+        # IMAGENET_STD = [0.229, 0.224, 0.225]
+        IMAGENET_MEAN = [0.5 , 0.5 , 0.5 ]
+        IMAGENET_STD = [0.5 , 0.5 , 0.5 ]
+
+        print("test")
+
+        # Check if preprocessor_config has incorrect normalization values
+        if "image_mean" in self.preprocessor_config:
+            current_mean = self.preprocessor_config["image_mean"]
+            if current_mean != IMAGENET_MEAN:
+                logger.warning(f"Overriding image_mean from {current_mean} to ImageNet standard {IMAGENET_MEAN}")
+                self.preprocessor_config["image_mean"] = IMAGENET_MEAN
+            print("test2")
+        else:
+            logger.info(f"Setting image_mean to ImageNet standard {IMAGENET_MEAN}")
+            self.preprocessor_config["image_mean"] = IMAGENET_MEAN
+
+        if "image_std" in self.preprocessor_config:
+            current_std = self.preprocessor_config["image_std"]
+            if current_std != IMAGENET_STD:
+                logger.warning(f"Overriding image_std from {current_std} to ImageNet standard {IMAGENET_STD}")
+                self.preprocessor_config["image_std"] = IMAGENET_STD
+        else:
+            logger.info(f"Setting image_std to ImageNet standard {IMAGENET_STD}")
+            self.preprocessor_config["image_std"] = IMAGENET_STD
+
+        # Now call parent which will use the corrected values
         super().set_gguf_parameters()
         hparams = self.hparams
 
