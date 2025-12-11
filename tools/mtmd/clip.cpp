@@ -923,65 +923,57 @@ struct clip_graph {
             }
         }
 
-// 3. Multi-Scale Fusion Adapter (MSFA)
+        // 3. Multi-Scale Fusion Adapter (MSFA) - FIXED LOGIC
         if (!intermediate_features.empty()) {
-            const int target_res = 16;
+            // A. Find the Highest Resolution among inputs (e.g., 32x32 from Stage 3)
+            int max_res = 0;
+            for (auto feat : intermediate_features) {
+                max_res = std::max(max_res, (int)feat->ne[0]);
+            }
+
             std::vector<ggml_tensor*> resized_feats;
 
+            // B. Resize all inputs to the Highest Resolution (Upsampling)
             for (auto feat : intermediate_features) {
                 int feat_res = feat->ne[0];
-                if (feat_res != target_res) {
-                    // Check if we can use simple pooling (integer scale)
-                    if (feat_res > target_res && feat_res % target_res == 0) {
-                        // Integer downsampling with pooling
-                        int s = feat_res / target_res;
-                        feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
-                    } else if (feat_res < target_res && target_res % feat_res == 0) {
-                        // Integer upsampling
-                        int s = target_res / feat_res;
-                        feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_NEAREST);
-                    } else {
-                        // Non-integer scale - use interpolation
-                        // For now, use adaptive pooling by calculating proper kernel/stride
-                        if (feat_res > target_res) {
-                            // Downsampling: calculate kernel size for desired output
-                            // output = (input - kernel) / stride + 1
-                            // We want output = target_res, so: kernel = input - (target_res - 1) * stride
-                            // Using stride = 1 for simplicity: kernel = input - target_res + 1
-                            int kernel = feat_res - target_res + 1;
-                            feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, kernel, kernel, 1, 1, 0, 0);
-                        } else {
-                            // Upsampling: use nearest neighbor scaling
-                            // Calculate scale as close integer approximation
-                            int s = (target_res + feat_res - 1) / feat_res;
-                            feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_NEAREST);
-                            // May need additional pooling if overshot
-                            if (feat->ne[0] > target_res) {
-                                int excess = feat->ne[0] - target_res + 1;
-                                feat = ggml_pool_2d(ctx0, feat, GGML_OP_POOL_AVG, excess, excess, 1, 1, 0, 0);
-                            }
-                        }
-                    }
+                if (feat_res < max_res) {
+                    // Upsample (Nearest neighbor per config)
+                    int s = max_res / feat_res;
+                    feat = ggml_upscale(ctx0, feat, s, GGML_SCALE_MODE_NEAREST);
                 }
+                // Note: We do NOT downsample here. We process at high res.
                 resized_feats.push_back(feat);
             }
 
-            // Concatenate
+            // C. Concatenate at High Resolution
             cur = resized_feats[0];
-            for (size_t k = 1; k < resized_feats.size(); ++k) cur = ggml_concat(ctx0, cur, resized_feats[k], 2); 
+            for (size_t k = 1; k < resized_feats.size(); ++k) {
+                cur = ggml_concat(ctx0, cur, resized_feats[k], 2); 
+            }
 
-            // Expansion
+            // D. Apply FFN (Conv blocks) at High Resolution
             if (model.msfa_ffn_expand_w) {
-                // ggml_tensor* exp_w = fix_1x1_weight(model.msfa_ffn_expand_w);
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_expand_w, cur, 1, 1, 0, 0, 1, 1);
                 cur = ggml_gelu(ctx0, cur);
             }
-            // Projection
             if (model.msfa_ffn_project_w) {
-                // ggml_tensor* proj_w = fix_1x1_weight(model.msfa_ffn_project_w);
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_project_w, cur, 1, 1, 0, 0, 1, 1);
             }
-            // Norm
+
+            // E. Final Downsample to Target Resolution (16x16)
+            const int target_res = 16;
+            int current_res = cur->ne[0];
+            
+            if (current_res > target_res) {
+                // Average Pool down to 16x16
+                // Calculate stride/kernel needed
+                // Assuming integer scaling for simplicity (32->16)
+                int s = current_res / target_res;
+                // Padding is usually 0 here for integer downsampling
+                cur = ggml_pool_2d(ctx0, cur, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
+            }
+
+            // F. Final Norm
             if (model.msfa_concat_norm_w) cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
         }
 
