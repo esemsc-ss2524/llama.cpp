@@ -23,6 +23,8 @@
 #include <limits>
 #include <array>
 #include <functional>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
@@ -485,6 +487,7 @@ struct clip_ctx {
     // for debugging
     bool debug_graph = false;
     std::vector<ggml_tensor *> debug_print_tensors;
+    std::vector<std::pair<std::string, ggml_tensor *>> debug_intermediate_tensors;
 
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
@@ -650,11 +653,11 @@ struct clip_graph {
     // ------------------------------------------------------------------------
     // Edge Residual Block (Stage 0)
     // ------------------------------------------------------------------------
-    ggml_tensor * build_edge_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride) {
+    ggml_tensor * build_edge_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride, int block_idx = -1) {
         ggml_tensor * cur = inp;
-        
+
         // 1. Expansion Conv (3x3) - Already correct shape {3, 3, Cin, Cout}
-        int pad = 1; 
+        int pad = 1;
         cur = ggml_conv_2d(ctx0, block.s0_conv_exp_w, cur, stride, stride, pad, pad, 1, 1);
         if (block.s0_bn1_w) cur = rms_norm_2d(cur, block.s0_bn1_w);
         cur = ggml_gelu(ctx0, cur);
@@ -669,14 +672,14 @@ struct clip_graph {
         if (stride == 1 && inp->ne[2] == cur->ne[2] && inp->ne[0] == cur->ne[0]) {
             cur = ggml_add(ctx0, cur, inp);
         }
-        
+
         return cur;
     }
 
     // ------------------------------------------------------------------------
     // Universal Inverted Residual Block (Stage 1+)
     // ------------------------------------------------------------------------
-    ggml_tensor * build_inverted_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride) {
+    ggml_tensor * build_inverted_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride, int block_idx = -1) {
         ggml_tensor * cur = inp;
 
         // 1. Depthwise Start (Optional)
@@ -736,10 +739,12 @@ struct clip_graph {
     // ------------------------------------------------------------------------
     // MobileNet Multi-Query Attention (MQA) - Corrected
     // ------------------------------------------------------------------------
-    ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block) {
+    ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block, int block_idx = -1) {
         ggml_tensor * cur = inp;
 
-        if (block.attn_norm_w) cur = rms_norm_2d(cur, block.attn_norm_w);
+        if (block.attn_norm_w) {
+            cur = rms_norm_2d(cur, block.attn_norm_w);
+        }
 
         // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
@@ -749,7 +754,9 @@ struct clip_graph {
         if (block.attn_k_dw_w) {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
-            if (block.attn_k_norm_w) k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
+            if (block.attn_k_norm_w) {
+                k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
+            }
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
@@ -758,7 +765,9 @@ struct clip_graph {
         if (block.attn_v_dw_w) {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
-            if (block.attn_v_norm_w) v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+            if (block.attn_v_norm_w) {
+                v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+            }
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
@@ -850,6 +859,7 @@ struct clip_graph {
             }
             cur = ggml_add(ctx0, cur, inp);
         }
+
         return cur;
     }
 
@@ -860,21 +870,30 @@ struct clip_graph {
     // MobileNetV5 Builder (Gemma 3n) - WITH DEBUGGING
     // ------------------------------------------------------------------------
     ggml_cgraph * build_mobilenetv5() {
+        // Clear previous debug tensors
+        ctx->debug_intermediate_tensors.clear();
+
         // Debug helper
         auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) {
             if (!t) {
                 fprintf(stderr, "DEBUG: %s is NULL\n", label);
                 return;
             }
-            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n", 
-                label, ggml_type_name(t->type), 
+            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n",
+                label, ggml_type_name(t->type),
                 t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        };
+
+        // Helper to register tensor for debugging
+        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
+            ctx->debug_intermediate_tensors.push_back({name, t});
         };
 
         fprintf(stderr, "\n--- START build_mobilenetv5 ---\n");
 
-        ggml_tensor * inp = build_inp_raw(); 
+        ggml_tensor * inp = build_inp_raw();
         DEBUG_SHAPE("Input Raw", inp);
+        // Note: inp_raw is saved directly from the vector in clip_image_batch_encode()
 
         // 1. Stem
         ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
@@ -883,7 +902,8 @@ struct clip_graph {
         }
         if (model.mobilenet_stem_norm_w) cur = rms_norm_2d(cur, model.mobilenet_stem_norm_w);
         cur = ggml_gelu(ctx0, cur);
-        
+        REGISTER_DEBUG("mobilenet_stem_output", cur);
+
         DEBUG_SHAPE("After Stem", cur);
 
         // 2. Blocks
@@ -912,9 +932,14 @@ struct clip_graph {
             const auto & block = model.mobilenet_blocks[i];
             int stride = is_stage_start(i) ? 2 : 1;
 
-            if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride);
-            else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block);
-            else                          cur = build_inverted_residual(cur, block, stride);
+            if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride, i);
+            else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block, i);
+            else                          cur = build_inverted_residual(cur, block, stride, i);
+
+            // Register block output for debugging
+            char block_name[64];
+            snprintf(block_name, sizeof(block_name), "mobilenet_block_%d_output", i);
+            REGISTER_DEBUG(block_name, cur);
 
             if (is_fusion_point(i)) {
                 fprintf(stderr, "DEBUG: Collecting fusion feature at block index %d\n", i);
@@ -948,22 +973,25 @@ struct clip_graph {
             // C. Concatenate at High Resolution
             cur = resized_feats[0];
             for (size_t k = 1; k < resized_feats.size(); ++k) {
-                cur = ggml_concat(ctx0, cur, resized_feats[k], 2); 
+                cur = ggml_concat(ctx0, cur, resized_feats[k], 2);
             }
+            REGISTER_DEBUG("msfa_concat", cur);
 
             // D. Apply FFN (Conv blocks) at High Resolution
             if (model.msfa_ffn_expand_w) {
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_expand_w, cur, 1, 1, 0, 0, 1, 1);
                 cur = ggml_gelu(ctx0, cur);
+                REGISTER_DEBUG("msfa_ffn_expand", cur);
             }
             if (model.msfa_ffn_project_w) {
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_project_w, cur, 1, 1, 0, 0, 1, 1);
+                REGISTER_DEBUG("msfa_ffn_project", cur);
             }
 
             // E. Final Downsample to Target Resolution (16x16)
             const int target_res = 16;
             int current_res = cur->ne[0];
-            
+
             if (current_res > target_res) {
                 // Average Pool down to 16x16
                 // Calculate stride/kernel needed
@@ -971,10 +999,14 @@ struct clip_graph {
                 int s = current_res / target_res;
                 // Padding is usually 0 here for integer downsampling
                 cur = ggml_pool_2d(ctx0, cur, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
+                REGISTER_DEBUG("msfa_downsample", cur);
             }
 
             // F. Final Norm
-            if (model.msfa_concat_norm_w) cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
+            if (model.msfa_concat_norm_w) {
+                cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
+                REGISTER_DEBUG("msfa_concat_norm", cur);
+            }
         }
 
         // ... (Keep existing projection section) ...
@@ -983,21 +1015,25 @@ struct clip_graph {
         int H = cur->ne[1];
         int C = cur->ne[2];
         int B = cur->ne[3];
-        
+
         cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
         cur = ggml_cont(ctx0, cur);
         cur = ggml_reshape_3d(ctx0, cur, C, W*H, B);
-        cur = ggml_cont(ctx0, cur); 
+        cur = ggml_cont(ctx0, cur);
 
         if (model.mm_input_proj_w) {
             cur = ggml_mul_mat(ctx0, model.mm_input_proj_w, cur);
+            REGISTER_DEBUG("mm_input_proj", cur);
         }
 
         if (model.mm_soft_emb_norm_w) {
             cur = ggml_rms_norm(ctx0, cur, eps);
             cur = ggml_mul(ctx0, cur, model.mm_soft_emb_norm_w);
+            REGISTER_DEBUG("mm_soft_emb_norm", cur);
         }
-        
+
+        REGISTER_DEBUG("final_output", cur);
+
         ggml_build_forward_expand(gf, cur);
         return gf;
     }
@@ -4094,6 +4130,7 @@ struct clip_model_loader {
     }
 };
 
+
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
     clip_ctx * ctx_vision = nullptr;
     clip_ctx * ctx_audio = nullptr;
@@ -4212,6 +4249,18 @@ static void normalize_image_u8_to_f32(const clip_image_u8 & src, clip_image_f32 
     for (size_t i = 0; i < src.buf.size(); ++i) {
         int c = i % 3; // rgb
         dst.buf[i] = (static_cast<float>(src.buf[i]) / 255.0f - mean[c]) / std[c];
+    }
+}
+
+// Rescale image from u8 to f32 without normalization (for models like GEMMA3N that use SiglipImageProcessorFast)
+// This only converts from [0, 255] to [0.0, 1.0] range without applying mean/std normalization
+static void rescale_image_u8_to_f32(const clip_image_u8 & src, clip_image_f32 & dst) {
+    dst.nx = src.nx;
+    dst.ny = src.ny;
+    dst.buf.resize(src.buf.size());
+ 
+    for (size_t i = 0; i < src.buf.size(); ++i) {
+        dst.buf[i] = static_cast<float>(src.buf[i]) / 255.0f;
     }
 }
 
@@ -4881,7 +4930,6 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
 
         case PROJECTOR_TYPE_GLM_EDGE:
         case PROJECTOR_TYPE_GEMMA3:
-        case PROJECTOR_TYPE_GEMMA3N:
         case PROJECTOR_TYPE_INTERNVL: // TODO @ngxson : support dynamic resolution
             {
                 clip_image_u8 resized_image;
@@ -4890,6 +4938,18 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 clip_image_f32_ptr img_f32(clip_image_f32_init());
                 //clip_image_save_to_bmp(resized_image, "resized.bmp");
                 normalize_image_u8_to_f32(resized_image, *img_f32, params.image_mean, params.image_std);
+                res_imgs->entries.push_back(std::move(img_f32));
+            } break;
+ 
+        case PROJECTOR_TYPE_GEMMA3N:
+            {
+                // GEMMA3N uses SiglipImageProcessorFast which only rescales to [0.0, 1.0] without normalization
+                // Resize to 768x768 using bilinear interpolation, then rescale to f32
+                clip_image_u8 resized_image;
+                int sz = params.image_size;
+                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BILINEAR, false);
+                clip_image_f32_ptr img_f32(clip_image_f32_init());
+                rescale_image_u8_to_f32(resized_image, *img_f32);
                 res_imgs->entries.push_back(std::move(img_f32));
             } break;
 
@@ -5306,6 +5366,28 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         }
         set_input_f32("inp_raw", inp_raw);
 
+        // Save inp_raw vector directly for debugging
+        const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+        if (save_tensors_env && atoi(save_tensors_env) == 1) {
+            const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
+            std::string output_path = output_dir ? output_dir : "debug_ggml_output";
+
+            // Create output directory if it doesn't exist
+            #ifdef _WIN32
+            _mkdir(output_path.c_str());
+            #else
+            mkdir(output_path.c_str(), 0755);
+            #endif
+
+            // Save the preprocessed image directly
+            const int nx = imgs.entries[0]->nx;
+            const int ny = imgs.entries[0]->ny;
+            // Shape in GGML layout: [W, H, C, B] = [nx, ny, 3, 1]
+            // Save as NumPy [B, C, H, W] = [1, 3, ny, nx]
+            std::string filepath = output_path + "/debug_inp_raw.npy";
+            save_vector_to_npy(inp_raw, {1, 3, ny, nx}, filepath);
+        }
+
     } else {
         // audio input
         GGML_ASSERT(imgs.entries.size() == 1);
@@ -5577,6 +5659,38 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             print_tensor_shape(t);
             print_tensor_data(t, data.data(), 3);
         }
+    }
+
+    // Save intermediate tensors to .npy files for debugging (Gemma 3n Vision)
+    // Set environment variable CLIP_DEBUG_SAVE_TENSORS=1 to enable
+    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+        const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
+        std::string output_path = output_dir ? output_dir : "debug_ggml_output";
+
+        // Create output directory if it doesn't exist
+        #ifdef _WIN32
+        _mkdir(output_path.c_str());
+        #else
+        mkdir(output_path.c_str(), 0755);
+        #endif
+
+        LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
+
+        // Iterate through registered debug tensors
+        for (const auto& item : ctx->debug_intermediate_tensors) {
+            const std::string& name = item.first;
+            ggml_tensor* tensor = item.second;
+
+            if (tensor) {
+                std::string filepath = output_path + "/debug_" + name + ".npy";
+                // Get backend for this tensor
+                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
+                save_tensor_to_npy(tensor, filepath, backend);
+            }
+        }
+
+        LOG_INF("=== Tensor saving complete (%zu tensors) ===\n\n", ctx->debug_intermediate_tensors.size());
     }
 
     // the last node is the embedding tensor

@@ -1,10 +1,12 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "clip.h"
 
 #include <climits>
 #include <cstdarg>
 #include <cinttypes>
+#include <cstring>
 #include <string>
 #include <map>
 #include <sstream>
@@ -525,6 +527,145 @@ static void print_tensor_data(ggml_tensor * t, uint8_t * data, int64_t n) {
         }
         printf("    ]\n");
     }
+}
+
+// Helper function to save tensor to NumPy .npy file format
+static void save_tensor_to_npy(ggml_tensor * t, const std::string & filepath, ggml_backend_t backend = nullptr) {
+    // NumPy .npy file format (version 1.0):
+    // - Magic number: \x93NUMPY
+    // - Version: 0x01 0x00 (major=1, minor=0)
+    // - Header length: 2 bytes (little endian)
+    // - Header dict: Python literal describing dtype and shape
+    // - Data: raw binary data in C order (last dimension varies fastest)
+
+    FILE * file = fopen(filepath.c_str(), "wb");
+    if (!file) {
+        LOG_ERR("Failed to open file for writing: %s\n", filepath.c_str());
+        return;
+    }
+
+    // Get tensor data
+    std::vector<uint8_t> data(ggml_nbytes(t));
+    if (backend) {
+        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+    } else {
+        memcpy(data.data(), t->data, ggml_nbytes(t));
+    }
+
+    // Convert to float32 for compatibility with PyTorch debug outputs
+    std::vector<float> data_f32(ggml_nelements(t));
+    for (int64_t i = 0; i < ggml_nelements(t); i++) {
+        if (t->type == GGML_TYPE_F32) {
+            data_f32[i] = ((float*)data.data())[i];
+        } else if (t->type == GGML_TYPE_F16) {
+            data_f32[i] = ggml_fp16_to_fp32(((ggml_fp16_t*)data.data())[i]);
+        } else {
+            LOG_ERR("Unsupported tensor type for numpy export: %s\n", ggml_type_name(t->type));
+            fclose(file);
+            return;
+        }
+    }
+
+    // Build header dictionary
+    std::ostringstream header;
+    header << "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+
+    // NumPy shape is reverse of GGML (GGML: [W,H,C,B] -> NumPy: [B,C,H,W])
+    int ndims = ggml_n_dims(t);
+    for (int i = ndims - 1; i >= 0; i--) {
+        header << t->ne[i];
+        if (i > 0) header << ", ";
+    }
+    header << ",), }";
+
+    std::string header_str = header.str();
+
+    // Pad header to be divisible by 64 (for alignment)
+    // Total header size = 10 (magic+version+len) + header_str.length() + 1 (newline)
+    int total_before_padding = 10 + header_str.length() + 1;
+    int padding = (64 - (total_before_padding % 64)) % 64;
+    header_str.append(padding, ' ');
+    header_str += '\n';
+
+    uint16_t header_len = header_str.length();
+
+    // Write magic number
+    fwrite("\x93NUMPY", 1, 6, file);
+
+    // Write version
+    uint8_t version[2] = {0x01, 0x00};
+    fwrite(version, 1, 2, file);
+
+    // Write header length (little endian)
+    fwrite(&header_len, 2, 1, file);
+
+    // Write header
+    fwrite(header_str.c_str(), 1, header_len, file);
+
+    // Write data
+    fwrite(data_f32.data(), sizeof(float), data_f32.size(), file);
+
+    fclose(file);
+    LOG_INF("Saved tensor '%s' with shape [", t->name);
+    for (int i = 0; i < ndims; i++) {
+        LOG_INF("%" PRId64, t->ne[i]);
+        if (i < ndims - 1) LOG_INF(", ");
+    }
+    LOG_INF("] to %s\n", filepath.c_str());
+}
+
+// Helper function to save a raw float vector to NumPy .npy file
+static void save_vector_to_npy(const std::vector<float>& data, const std::vector<int64_t>& shape, const std::string& filepath) {
+    FILE * file = fopen(filepath.c_str(), "wb");
+    if (!file) {
+        LOG_ERR("Failed to open file for writing: %s\n", filepath.c_str());
+        return;
+    }
+
+    // Build header dictionary
+    std::ostringstream header;
+    header << "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+
+    for (size_t i = 0; i < shape.size(); i++) {
+        header << shape[i];
+        if (i < shape.size() - 1) header << ", ";
+    }
+    header << ",), }";
+
+    std::string header_str = header.str();
+
+    // Pad header to be divisible by 64 (for alignment)
+    int total_before_padding = 10 + header_str.length() + 1;
+    int padding = (64 - (total_before_padding % 64)) % 64;
+    header_str.append(padding, ' ');
+    header_str += '\n';
+
+    uint16_t header_len = header_str.length();
+
+    // Write magic number
+    fwrite("\x93NUMPY", 1, 6, file);
+
+    // Write version
+    uint8_t version[2] = {0x01, 0x00};
+    fwrite(version, 1, 2, file);
+
+    // Write header length (little endian)
+    fwrite(&header_len, 2, 1, file);
+
+    // Write header
+    fwrite(header_str.c_str(), 1, header_len, file);
+
+    // Write data
+    fwrite(data.data(), sizeof(float), data.size(), file);
+
+    fclose(file);
+
+    LOG_INF("Saved vector with shape [");
+    for (size_t i = 0; i < shape.size(); i++) {
+        LOG_INF("%" PRId64, shape[i]);
+        if (i < shape.size() - 1) LOG_INF(", ");
+    }
+    LOG_INF("] to %s\n", filepath.c_str());
 }
 
 //
