@@ -885,7 +885,12 @@ struct clip_graph {
         };
 
         // Helper to register tensor for debugging
+        // CRITICAL: We must name the tensor so we can retrieve it from the graph after computation
+        // The pointer we have now won't have the actual data until the backend scheduler runs
         auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
+            // Set the tensor's name so we can find it in the graph later
+            ggml_set_name(t, name.c_str());
+            // Store the name (we'll retrieve the tensor from the graph after computation)
             ctx->debug_intermediate_tensors.push_back({name, t});
         };
 
@@ -5682,35 +5687,43 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // again for safety before reading multiple tensors
         ggml_backend_sched_synchronize(ctx->sched.get());
 
-        // Iterate through registered debug tensors
+        // CRITICAL: Retrieve tensors from the COMPUTED GRAPH, not from the pointers
+        // we saved during graph building. The backend scheduler allocates memory
+        // and computes values AFTER graph building, so we must get the actual
+        // tensor nodes from the graph to read the computed data.
+        int saved_count = 0;
+        int skipped_count = 0;
+
         for (const auto& item : ctx->debug_intermediate_tensors) {
             const std::string& name = item.first;
-            ggml_tensor* tensor = item.second;
 
-            if (tensor) {
-                std::string filepath = output_path + "/debug_" + name + ".npy";
+            // Retrieve the tensor from the computed graph by name
+            ggml_tensor* tensor = ggml_graph_get_tensor(gf, name.c_str());
 
-                // Get backend for this tensor
-                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
-
-                if (!backend) {
-                    LOG_WRN("Warning: No backend found for tensor '%s', skipping\n", name.c_str());
-                    continue;
-                }
-
-                // Verify tensor has valid data pointer or backend allocation
-                if (!tensor->data && !backend) {
-                    LOG_WRN("Warning: Tensor '%s' has no data and no backend, skipping\n", name.c_str());
-                    continue;
-                }
-
-                save_tensor_to_npy(tensor, filepath, backend);
-            } else {
-                LOG_WRN("Warning: Null tensor registered as '%s', skipping\n", name.c_str());
+            if (!tensor) {
+                LOG_WRN("Warning: Tensor '%s' not found in computed graph, skipping\n", name.c_str());
+                skipped_count++;
+                continue;
             }
+
+            std::string filepath = output_path + "/debug_" + name + ".npy";
+
+            // Get backend for this tensor
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
+
+            if (!backend) {
+                LOG_WRN("Warning: No backend found for tensor '%s', skipping\n", name.c_str());
+                skipped_count++;
+                continue;
+            }
+
+            // Save the tensor (it now has the actual computed data)
+            save_tensor_to_npy(tensor, filepath, backend);
+            saved_count++;
         }
 
-        LOG_INF("=== Tensor saving complete (%zu tensors) ===\n\n", ctx->debug_intermediate_tensors.size());
+        LOG_INF("=== Tensor saving complete: %d saved, %d skipped (total %zu registered) ===\n\n",
+                saved_count, skipped_count, ctx->debug_intermediate_tensors.size());
     }
 
     // the last node is the embedding tensor
