@@ -4130,6 +4130,7 @@ struct clip_model_loader {
     }
 };
 
+
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
     clip_ctx * ctx_vision = nullptr;
     clip_ctx * ctx_audio = nullptr;
@@ -4248,6 +4249,18 @@ static void normalize_image_u8_to_f32(const clip_image_u8 & src, clip_image_f32 
     for (size_t i = 0; i < src.buf.size(); ++i) {
         int c = i % 3; // rgb
         dst.buf[i] = (static_cast<float>(src.buf[i]) / 255.0f - mean[c]) / std[c];
+    }
+}
+
+// Rescale image from u8 to f32 without normalization (for models like GEMMA3N that use SiglipImageProcessorFast)
+// This only converts from [0, 255] to [0.0, 1.0] range without applying mean/std normalization
+static void rescale_image_u8_to_f32(const clip_image_u8 & src, clip_image_f32 & dst) {
+    dst.nx = src.nx;
+    dst.ny = src.ny;
+    dst.buf.resize(src.buf.size());
+ 
+    for (size_t i = 0; i < src.buf.size(); ++i) {
+        dst.buf[i] = static_cast<float>(src.buf[i]) / 255.0f;
     }
 }
 
@@ -4917,7 +4930,6 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
 
         case PROJECTOR_TYPE_GLM_EDGE:
         case PROJECTOR_TYPE_GEMMA3:
-        case PROJECTOR_TYPE_GEMMA3N:
         case PROJECTOR_TYPE_INTERNVL: // TODO @ngxson : support dynamic resolution
             {
                 clip_image_u8 resized_image;
@@ -4926,6 +4938,18 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 clip_image_f32_ptr img_f32(clip_image_f32_init());
                 //clip_image_save_to_bmp(resized_image, "resized.bmp");
                 normalize_image_u8_to_f32(resized_image, *img_f32, params.image_mean, params.image_std);
+                res_imgs->entries.push_back(std::move(img_f32));
+            } break;
+ 
+        case PROJECTOR_TYPE_GEMMA3N:
+            {
+                // GEMMA3N uses SiglipImageProcessorFast which only rescales to [0.0, 1.0] without normalization
+                // Resize to 768x768 using bilinear interpolation, then rescale to f32
+                clip_image_u8 resized_image;
+                int sz = params.image_size;
+                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BILINEAR, false);
+                clip_image_f32_ptr img_f32(clip_image_f32_init());
+                rescale_image_u8_to_f32(resized_image, *img_f32);
                 res_imgs->entries.push_back(std::move(img_f32));
             } break;
 
