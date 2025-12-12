@@ -1,10 +1,12 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "clip.h"
 
 #include <climits>
 #include <cstdarg>
 #include <cinttypes>
+#include <cstring>
 #include <string>
 #include <map>
 #include <sstream>

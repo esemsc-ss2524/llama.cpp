@@ -487,6 +487,7 @@ struct clip_ctx {
     // for debugging
     bool debug_graph = false;
     std::vector<ggml_tensor *> debug_print_tensors;
+    std::vector<std::pair<std::string, ggml_tensor *>> debug_intermediate_tensors;
 
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
@@ -672,13 +673,6 @@ struct clip_graph {
             cur = ggml_add(ctx0, cur, inp);
         }
 
-        // Name tensor for debugging
-        if (block_idx >= 0) {
-            char name[128];
-            snprintf(name, sizeof(name), "mobilenet_block_%d_edge_residual", block_idx);
-            ggml_set_name(cur, name);
-        }
-
         return cur;
     }
 
@@ -733,25 +727,10 @@ struct clip_graph {
                 ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
                     1, block.layer_scale_w->ne[0], 1, 1);
                 scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
-
-                // Name layer_scale output for debugging
-                if (block_idx >= 0) {
-                    char name[128];
-                    snprintf(name, sizeof(name), "mobilenet_block_%d_layer_scale", block_idx);
-                    ggml_set_name(scaled, name);
-                }
-
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
                 cur = ggml_cont(ctx0, cur);
             }
             cur = ggml_add(ctx0, cur, inp);
-        }
-
-        // Name tensor for debugging
-        if (block_idx >= 0) {
-            char name[128];
-            snprintf(name, sizeof(name), "mobilenet_block_%d_inverted_residual", block_idx);
-            ggml_set_name(cur, name);
         }
 
         return cur;
@@ -765,12 +744,6 @@ struct clip_graph {
 
         if (block.attn_norm_w) {
             cur = rms_norm_2d(cur, block.attn_norm_w);
-            // Name norm output for debugging
-            if (block_idx >= 0) {
-                char name[128];
-                snprintf(name, sizeof(name), "mobilenet_block_%d_attn_norm", block_idx);
-                ggml_set_name(cur, name);
-            }
         }
 
         // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
@@ -783,12 +756,6 @@ struct clip_graph {
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_k_norm_w) {
                 k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
-                // Name key norm for debugging
-                if (block_idx >= 0) {
-                    char name[128];
-                    snprintf(name, sizeof(name), "mobilenet_block_%d_attn_key_norm", block_idx);
-                    ggml_set_name(k_inp, name);
-                }
             }
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
@@ -800,12 +767,6 @@ struct clip_graph {
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_v_norm_w) {
                 v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
-                // Name value norm for debugging
-                if (block_idx >= 0) {
-                    char name[128];
-                    snprintf(name, sizeof(name), "mobilenet_block_%d_attn_value_norm", block_idx);
-                    ggml_set_name(v_inp, name);
-                }
             }
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
@@ -899,13 +860,6 @@ struct clip_graph {
             cur = ggml_add(ctx0, cur, inp);
         }
 
-        // Name tensor for debugging
-        if (block_idx >= 0) {
-            char name[128];
-            snprintf(name, sizeof(name), "mobilenet_block_%d_attn_output", block_idx);
-            ggml_set_name(cur, name);
-        }
-
         return cur;
     }
 
@@ -916,21 +870,30 @@ struct clip_graph {
     // MobileNetV5 Builder (Gemma 3n) - WITH DEBUGGING
     // ------------------------------------------------------------------------
     ggml_cgraph * build_mobilenetv5() {
+        // Clear previous debug tensors
+        ctx->debug_intermediate_tensors.clear();
+
         // Debug helper
         auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) {
             if (!t) {
                 fprintf(stderr, "DEBUG: %s is NULL\n", label);
                 return;
             }
-            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n", 
-                label, ggml_type_name(t->type), 
+            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n",
+                label, ggml_type_name(t->type),
                 t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        };
+
+        // Helper to register tensor for debugging
+        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
+            ctx->debug_intermediate_tensors.push_back({name, t});
         };
 
         fprintf(stderr, "\n--- START build_mobilenetv5 ---\n");
 
-        ggml_tensor * inp = build_inp_raw(); 
+        ggml_tensor * inp = build_inp_raw();
         DEBUG_SHAPE("Input Raw", inp);
+        REGISTER_DEBUG("inp_raw", inp);
 
         // 1. Stem
         ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
@@ -939,7 +902,7 @@ struct clip_graph {
         }
         if (model.mobilenet_stem_norm_w) cur = rms_norm_2d(cur, model.mobilenet_stem_norm_w);
         cur = ggml_gelu(ctx0, cur);
-        ggml_set_name(cur, "mobilenet_stem_output");
+        REGISTER_DEBUG("mobilenet_stem_output", cur);
 
         DEBUG_SHAPE("After Stem", cur);
 
@@ -972,6 +935,11 @@ struct clip_graph {
             if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride, i);
             else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block, i);
             else                          cur = build_inverted_residual(cur, block, stride, i);
+
+            // Register block output for debugging
+            char block_name[64];
+            snprintf(block_name, sizeof(block_name), "mobilenet_block_%d_output", i);
+            REGISTER_DEBUG(block_name, cur);
 
             if (is_fusion_point(i)) {
                 fprintf(stderr, "DEBUG: Collecting fusion feature at block index %d\n", i);
@@ -1007,17 +975,17 @@ struct clip_graph {
             for (size_t k = 1; k < resized_feats.size(); ++k) {
                 cur = ggml_concat(ctx0, cur, resized_feats[k], 2);
             }
-            ggml_set_name(cur, "msfa_concat");
+            REGISTER_DEBUG("msfa_concat", cur);
 
             // D. Apply FFN (Conv blocks) at High Resolution
             if (model.msfa_ffn_expand_w) {
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_expand_w, cur, 1, 1, 0, 0, 1, 1);
                 cur = ggml_gelu(ctx0, cur);
-                ggml_set_name(cur, "msfa_ffn_expand");
+                REGISTER_DEBUG("msfa_ffn_expand", cur);
             }
             if (model.msfa_ffn_project_w) {
                 cur = ggml_conv_2d(ctx0, model.msfa_ffn_project_w, cur, 1, 1, 0, 0, 1, 1);
-                ggml_set_name(cur, "msfa_ffn_project");
+                REGISTER_DEBUG("msfa_ffn_project", cur);
             }
 
             // E. Final Downsample to Target Resolution (16x16)
@@ -1031,13 +999,13 @@ struct clip_graph {
                 int s = current_res / target_res;
                 // Padding is usually 0 here for integer downsampling
                 cur = ggml_pool_2d(ctx0, cur, GGML_OP_POOL_AVG, s, s, s, s, 0, 0);
-                ggml_set_name(cur, "msfa_downsample");
+                REGISTER_DEBUG("msfa_downsample", cur);
             }
 
             // F. Final Norm
             if (model.msfa_concat_norm_w) {
                 cur = rms_norm_2d(cur, model.msfa_concat_norm_w);
-                ggml_set_name(cur, "msfa_concat_norm");
+                REGISTER_DEBUG("msfa_concat_norm", cur);
             }
         }
 
@@ -1055,14 +1023,16 @@ struct clip_graph {
 
         if (model.mm_input_proj_w) {
             cur = ggml_mul_mat(ctx0, model.mm_input_proj_w, cur);
-            ggml_set_name(cur, "mm_input_proj");
+            REGISTER_DEBUG("mm_input_proj", cur);
         }
 
         if (model.mm_soft_emb_norm_w) {
             cur = ggml_rms_norm(ctx0, cur, eps);
             cur = ggml_mul(ctx0, cur, model.mm_soft_emb_norm_w);
-            ggml_set_name(cur, "mm_soft_emb_norm");
+            REGISTER_DEBUG("mm_soft_emb_norm", cur);
         }
+
+        REGISTER_DEBUG("final_output", cur);
 
         ggml_build_forward_expand(gf, cur);
         return gf;
@@ -5661,29 +5631,20 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
         LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
 
-        // Iterate through all nodes in the graph and save named tensors
-        for (int i = 0; i < gf->n_nodes; i++) {
-            ggml_tensor * node = gf->nodes[i];
-            if (node->name && strlen(node->name) > 0) {
-                // Save tensors that match our naming patterns
-                std::string name_str(node->name);
-                bool should_save = (
-                    name_str.find("mobilenet_") != std::string::npos ||
-                    name_str.find("msfa_") != std::string::npos ||
-                    name_str.find("mm_") != std::string::npos ||
-                    name_str == "inp_raw"
-                );
+        // Iterate through registered debug tensors
+        for (const auto& item : ctx->debug_intermediate_tensors) {
+            const std::string& name = item.first;
+            ggml_tensor* tensor = item.second;
 
-                if (should_save) {
-                    std::string filepath = output_path + "/debug_" + name_str + ".npy";
-                    // Get backend for this tensor
-                    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), node);
-                    save_tensor_to_npy(node, filepath, backend);
-                }
+            if (tensor) {
+                std::string filepath = output_path + "/debug_" + name + ".npy";
+                // Get backend for this tensor
+                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
+                save_tensor_to_npy(tensor, filepath, backend);
             }
         }
 
-        LOG_INF("=== Tensor saving complete ===\n\n");
+        LOG_INF("=== Tensor saving complete (%zu tensors) ===\n\n", ctx->debug_intermediate_tensors.size());
     }
 
     // the last node is the embedding tensor
