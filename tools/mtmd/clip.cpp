@@ -17,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 #include <cinttypes>
@@ -5667,6 +5668,55 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         return false;
     }
 
+    // CRITICAL: Read tensor data IMMEDIATELY after computation while buffers are still valid
+    // Store the data in memory before the scheduler potentially frees/reuses buffers
+    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+    std::vector<std::tuple<std::string, std::vector<float>, std::vector<int64_t>>> captured_tensors;
+
+    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+        LOG_INF("\n=== Capturing intermediate tensor data immediately after computation ===\n");
+
+        for (const auto& item : ctx->debug_intermediate_tensors) {
+            const std::string& name = item.first;
+            ggml_tensor* tensor = item.second;
+
+            if (!tensor) {
+                LOG_WRN("Warning: Null tensor registered as '%s', skipping\n", name.c_str());
+                continue;
+            }
+
+            // Read the tensor data RIGHT NOW while backend buffers are still valid
+            int64_t nelements = ggml_nelements(tensor);
+            size_t nbytes = ggml_nbytes(tensor);
+
+            std::vector<uint8_t> data(nbytes);
+            ggml_backend_tensor_get(tensor, data.data(), 0, nbytes);
+
+            // Convert to float32 immediately
+            std::vector<float> data_f32(nelements);
+            for (int64_t i = 0; i < nelements; i++) {
+                if (tensor->type == GGML_TYPE_F32) {
+                    data_f32[i] = ((float*)data.data())[i];
+                } else if (tensor->type == GGML_TYPE_F16) {
+                    data_f32[i] = ggml_fp16_to_fp32(((ggml_fp16_t*)data.data())[i]);
+                }
+            }
+
+            // Store shape
+            int ndims = ggml_n_dims(tensor);
+            std::vector<int64_t> shape;
+            for (int i = ndims - 1; i >= 0; i--) {  // Reverse for NumPy
+                shape.push_back(tensor->ne[i]);
+            }
+
+            // Save to captured_tensors for later writing
+            captured_tensors.push_back(std::make_tuple(name, data_f32, shape));
+            LOG_INF("  Captured tensor '%s' (%zu elements)\n", name.c_str(), data_f32.size());
+        }
+
+        LOG_INF("=== Captured %zu tensors ===\n\n", captured_tensors.size());
+    }
+
     // print debug nodes
     if (ctx->debug_graph) {
         LOG_INF("\n\n---\n\n");
@@ -5679,10 +5729,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         }
     }
 
-    // Save intermediate tensors to .npy files for debugging (Gemma 3n Vision)
-    // Set environment variable CLIP_DEBUG_SAVE_TENSORS=1 to enable
-    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
-    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+    // Write captured tensor data to .npy files
+    // This happens AFTER the critical immediate capture above
+    if (save_tensors_env && atoi(save_tensors_env) == 1 && !captured_tensors.empty()) {
         const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
         std::string output_path = output_dir ? output_dir : "debug_ggml_output";
 
@@ -5693,49 +5742,18 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         mkdir(output_path.c_str(), 0755);
         #endif
 
-        LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
+        LOG_INF("\n=== Writing captured tensors to disk: %s ===\n", output_path.c_str());
 
-        // Explicitly synchronize all backends to ensure all tensor data is available
-        // This is CRITICAL - it ensures all GPU/CPU computations are complete and
-        // data is ready to be read via ggml_backend_tensor_get()
-        ggml_backend_sched_synchronize(ctx->sched.get());
-
-        // CRITICAL: Use ggml_backend_tensor_get() to read computed data
-        // The tensor pointers we stored during graph building are valid references.
-        // After ggml_backend_sched_graph_compute() runs, the backend has allocated
-        // memory and computed values for these tensors. We use ggml_backend_tensor_get()
-        // to retrieve the actual computed values from wherever the backend stored them.
-        int saved_count = 0;
-        int skipped_count = 0;
-
-        for (const auto& item : ctx->debug_intermediate_tensors) {
-            const std::string& name = item.first;
-            ggml_tensor* tensor = item.second;
-
-            if (!tensor) {
-                LOG_WRN("Warning: Null tensor registered as '%s', skipping\n", name.c_str());
-                skipped_count++;
-                continue;
-            }
-
-            // Get the backend that owns this tensor's data
-            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
-
-            if (!backend) {
-                LOG_WRN("Warning: No backend found for tensor '%s', skipping\n", name.c_str());
-                skipped_count++;
-                continue;
-            }
+        for (const auto& item : captured_tensors) {
+            const std::string& name = std::get<0>(item);
+            const std::vector<float>& data = std::get<1>(item);
+            const std::vector<int64_t>& shape = std::get<2>(item);
 
             std::string filepath = output_path + "/debug_" + name + ".npy";
-
-            // save_tensor_to_npy uses ggml_backend_tensor_get() to read the computed data
-            save_tensor_to_npy(tensor, filepath, backend);
-            saved_count++;
+            save_vector_to_npy(data, shape, filepath);
         }
 
-        LOG_INF("=== Tensor saving complete: %d saved, %d skipped (total %zu registered) ===\n\n",
-                saved_count, skipped_count, ctx->debug_intermediate_tensors.size());
+        LOG_INF("=== Successfully wrote %zu tensors to disk ===\n\n", captured_tensors.size());
     }
 
     // the last node is the embedding tensor
