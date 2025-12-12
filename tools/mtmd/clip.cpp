@@ -5373,8 +5373,19 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         }
         set_input_f32("inp_raw", inp_raw);
 
-        // Save inp_raw vector directly for debugging
+        // DEBUG: Test if ggml_backend_tensor_get works immediately after set
         const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+        if (save_tensors_env && atoi(save_tensors_env) == 1) {
+            ggml_tensor* inp_raw_tensor = get_inp_tensor("inp_raw");
+            std::vector<float> test_read(100);  // Read first 100 values
+            ggml_backend_tensor_get(inp_raw_tensor, test_read.data(), 0, 100 * sizeof(float));
+            LOG_INF("DEBUG: First 10 values of inp_raw after set_input_f32:\n");
+            for (int i = 0; i < 10; i++) {
+                LOG_INF("  [%d] = %.6f (expected: %.6f)\n", i, test_read[i], inp_raw[i]);
+            }
+        }
+
+        // Save inp_raw vector directly for debugging
         if (save_tensors_env && atoi(save_tensors_env) == 1) {
             const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
             std::string output_path = output_dir ? output_dir : "debug_ggml_output";
