@@ -893,7 +893,7 @@ struct clip_graph {
 
         ggml_tensor * inp = build_inp_raw();
         DEBUG_SHAPE("Input Raw", inp);
-        REGISTER_DEBUG("inp_raw", inp);
+        // Note: inp_raw is saved directly from the vector in clip_image_batch_encode()
 
         // 1. Stem
         ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
@@ -5341,6 +5341,28 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             }
         }
         set_input_f32("inp_raw", inp_raw);
+
+        // Save inp_raw vector directly for debugging
+        const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+        if (save_tensors_env && atoi(save_tensors_env) == 1) {
+            const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
+            std::string output_path = output_dir ? output_dir : "debug_ggml_output";
+
+            // Create output directory if it doesn't exist
+            #ifdef _WIN32
+            _mkdir(output_path.c_str());
+            #else
+            mkdir(output_path.c_str(), 0755);
+            #endif
+
+            // Save the preprocessed image directly
+            const int nx = imgs.entries[0]->nx;
+            const int ny = imgs.entries[0]->ny;
+            // Shape in GGML layout: [W, H, C, B] = [nx, ny, 3, 1]
+            // Save as NumPy [B, C, H, W] = [1, 3, ny, nx]
+            std::string filepath = output_path + "/debug_inp_raw.npy";
+            save_vector_to_npy(inp_raw, {1, 3, ny, nx}, filepath);
+        }
 
     } else {
         // audio input

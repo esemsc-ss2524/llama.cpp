@@ -614,6 +614,60 @@ static void save_tensor_to_npy(ggml_tensor * t, const std::string & filepath, gg
     LOG_INF("] to %s\n", filepath.c_str());
 }
 
+// Helper function to save a raw float vector to NumPy .npy file
+static void save_vector_to_npy(const std::vector<float>& data, const std::vector<int64_t>& shape, const std::string& filepath) {
+    FILE * file = fopen(filepath.c_str(), "wb");
+    if (!file) {
+        LOG_ERR("Failed to open file for writing: %s\n", filepath.c_str());
+        return;
+    }
+
+    // Build header dictionary
+    std::ostringstream header;
+    header << "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+
+    for (size_t i = 0; i < shape.size(); i++) {
+        header << shape[i];
+        if (i < shape.size() - 1) header << ", ";
+    }
+    header << ",), }";
+
+    std::string header_str = header.str();
+
+    // Pad header to be divisible by 64 (for alignment)
+    int total_before_padding = 10 + header_str.length() + 1;
+    int padding = (64 - (total_before_padding % 64)) % 64;
+    header_str.append(padding, ' ');
+    header_str += '\n';
+
+    uint16_t header_len = header_str.length();
+
+    // Write magic number
+    fwrite("\x93NUMPY", 1, 6, file);
+
+    // Write version
+    uint8_t version[2] = {0x01, 0x00};
+    fwrite(version, 1, 2, file);
+
+    // Write header length (little endian)
+    fwrite(&header_len, 2, 1, file);
+
+    // Write header
+    fwrite(header_str.c_str(), 1, header_len, file);
+
+    // Write data
+    fwrite(data.data(), sizeof(float), data.size(), file);
+
+    fclose(file);
+
+    LOG_INF("Saved vector with shape [");
+    for (size_t i = 0; i < shape.size(); i++) {
+        LOG_INF("%" PRId64, shape[i]);
+        if (i < shape.size() - 1) LOG_INF(", ");
+    }
+    LOG_INF("] to %s\n", filepath.c_str());
+}
+
 //
 // API used internally with mtmd
 //
