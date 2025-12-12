@@ -5677,6 +5677,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
         LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
 
+        // Explicitly synchronize all backends to ensure all tensor data is available
+        // Note: ggml_backend_sched_graph_compute() already calls this, but we do it
+        // again for safety before reading multiple tensors
+        ggml_backend_sched_synchronize(ctx->sched.get());
+
         // Iterate through registered debug tensors
         for (const auto& item : ctx->debug_intermediate_tensors) {
             const std::string& name = item.first;
@@ -5684,9 +5689,24 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
             if (tensor) {
                 std::string filepath = output_path + "/debug_" + name + ".npy";
+
                 // Get backend for this tensor
                 ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
+
+                if (!backend) {
+                    LOG_WRN("Warning: No backend found for tensor '%s', skipping\n", name.c_str());
+                    continue;
+                }
+
+                // Verify tensor has valid data pointer or backend allocation
+                if (!tensor->data && !backend) {
+                    LOG_WRN("Warning: Tensor '%s' has no data and no backend, skipping\n", name.c_str());
+                    continue;
+                }
+
                 save_tensor_to_npy(tensor, filepath, backend);
+            } else {
+                LOG_WRN("Warning: Null tensor registered as '%s', skipping\n", name.c_str());
             }
         }
 
