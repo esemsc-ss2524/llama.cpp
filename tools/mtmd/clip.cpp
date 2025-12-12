@@ -898,7 +898,9 @@ struct clip_graph {
 
         ggml_tensor * inp = build_inp_raw();
         DEBUG_SHAPE("Input Raw", inp);
-        // Note: inp_raw is saved directly from the vector in clip_image_batch_encode()
+        // Register inp_raw to test if ggml_backend_tensor_get works for input tensors
+        // This will be saved as "inp_raw_from_graph" to distinguish from the direct vector save
+        REGISTER_DEBUG("inp_raw_from_graph", inp);
 
         // 1. Stem
         ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
