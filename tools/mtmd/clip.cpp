@@ -885,12 +885,12 @@ struct clip_graph {
         };
 
         // Helper to register tensor for debugging
-        // CRITICAL: We must name the tensor so we can retrieve it from the graph after computation
-        // The pointer we have now won't have the actual data until the backend scheduler runs
+        // Store the tensor pointer - after computation, we'll use ggml_backend_tensor_get()
+        // to read the computed data from wherever the backend stored it
         auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
-            // Set the tensor's name so we can find it in the graph later
+            // Set the tensor's name for debugging/logging purposes
             ggml_set_name(t, name.c_str());
-            // Store the name (we'll retrieve the tensor from the graph after computation)
+            // Store the tensor pointer - we'll read its data after computation
             ctx->debug_intermediate_tensors.push_back({name, t});
         };
 
@@ -5683,32 +5683,29 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
 
         // Explicitly synchronize all backends to ensure all tensor data is available
-        // Note: ggml_backend_sched_graph_compute() already calls this, but we do it
-        // again for safety before reading multiple tensors
+        // This is CRITICAL - it ensures all GPU/CPU computations are complete and
+        // data is ready to be read via ggml_backend_tensor_get()
         ggml_backend_sched_synchronize(ctx->sched.get());
 
-        // CRITICAL: Retrieve tensors from the COMPUTED GRAPH, not from the pointers
-        // we saved during graph building. The backend scheduler allocates memory
-        // and computes values AFTER graph building, so we must get the actual
-        // tensor nodes from the graph to read the computed data.
+        // CRITICAL: Use ggml_backend_tensor_get() to read computed data
+        // The tensor pointers we stored during graph building are valid references.
+        // After ggml_backend_sched_graph_compute() runs, the backend has allocated
+        // memory and computed values for these tensors. We use ggml_backend_tensor_get()
+        // to retrieve the actual computed values from wherever the backend stored them.
         int saved_count = 0;
         int skipped_count = 0;
 
         for (const auto& item : ctx->debug_intermediate_tensors) {
             const std::string& name = item.first;
-
-            // Retrieve the tensor from the computed graph by name
-            ggml_tensor* tensor = ggml_graph_get_tensor(gf, name.c_str());
+            ggml_tensor* tensor = item.second;
 
             if (!tensor) {
-                LOG_WRN("Warning: Tensor '%s' not found in computed graph, skipping\n", name.c_str());
+                LOG_WRN("Warning: Null tensor registered as '%s', skipping\n", name.c_str());
                 skipped_count++;
                 continue;
             }
 
-            std::string filepath = output_path + "/debug_" + name + ".npy";
-
-            // Get backend for this tensor
+            // Get the backend that owns this tensor's data
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
 
             if (!backend) {
@@ -5717,7 +5714,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 continue;
             }
 
-            // Save the tensor (it now has the actual computed data)
+            std::string filepath = output_path + "/debug_" + name + ".npy";
+
+            // save_tensor_to_npy uses ggml_backend_tensor_get() to read the computed data
             save_tensor_to_npy(tensor, filepath, backend);
             saved_count++;
         }
