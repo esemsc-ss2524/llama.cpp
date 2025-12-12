@@ -5678,10 +5678,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
         for (const auto& item : ctx->debug_intermediate_tensors) {
             const std::string& name = item.first;
-            ggml_tensor* tensor = item.second;
+
+            // CRITICAL: Retrieve tensor from the computed graph BY NAME
+            // The pointer we stored during graph building is from the build context
+            // and may not be valid after the scheduler processes the graph
+            ggml_tensor* tensor = ggml_graph_get_tensor(gf, name.c_str());
 
             if (!tensor) {
-                LOG_WRN("Warning: Null tensor registered as '%s', skipping\n", name.c_str());
+                LOG_WRN("Warning: Tensor '%s' not found in computed graph, skipping\n", name.c_str());
                 continue;
             }
 
