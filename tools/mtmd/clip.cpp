@@ -886,13 +886,25 @@ struct clip_graph {
         };
 
         // Helper to register tensor for debugging
-        // CRITICAL: Mark as output so the scheduler keeps the tensor data valid after computation
+        // CRITICAL: Follow ggml_easy::debug_print pattern EXACTLY
         auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
-            // Set the tensor's name for debugging/logging purposes
+            // If tensor has flags (input/output/etc), we need to COPY it first
+            // This is what ggml_easy does to prevent corrupting the graph
+            if (t->flags) {
+                // Create a copy: ggml_cpy(gf_ctx, t, ggml_dup_tensor(gf_ctx, t))
+                t = ggml_cpy(ctx0, t, ggml_dup_tensor(ctx0, t));
+            }
+
+            // Set the name
             ggml_set_name(t, name.c_str());
-            // CRITICAL: Mark as output - this tells the scheduler to preserve this tensor's data
-            // Without this, the backend may reuse/free the buffer after computation
+
+            // Mark as output - tells scheduler to preserve this tensor's data
             ggml_set_output(t);
+
+            // CRITICAL: Add to graph with ggml_build_forward_expand
+            // This is what ggml_easy::mark_output does!
+            ggml_build_forward_expand(gf, t);
+
             // Store the tensor pointer - we'll read its data after computation
             ctx->debug_intermediate_tensors.push_back({name, t});
         };
