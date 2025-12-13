@@ -886,11 +886,13 @@ struct clip_graph {
         };
 
         // Helper to register tensor for debugging
-        // Store the tensor pointer - after computation, we'll use ggml_backend_tensor_get()
-        // to read the computed data from wherever the backend stored it
+        // CRITICAL: Mark as output so the scheduler keeps the tensor data valid after computation
         auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
             // Set the tensor's name for debugging/logging purposes
             ggml_set_name(t, name.c_str());
+            // CRITICAL: Mark as output - this tells the scheduler to preserve this tensor's data
+            // Without this, the backend may reuse/free the buffer after computation
+            ggml_set_output(t);
             // Store the tensor pointer - we'll read its data after computation
             ctx->debug_intermediate_tensors.push_back({name, t});
         };
@@ -5678,14 +5680,10 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
         for (const auto& item : ctx->debug_intermediate_tensors) {
             const std::string& name = item.first;
-
-            // CRITICAL: Retrieve tensor from the computed graph BY NAME
-            // The pointer we stored during graph building is from the build context
-            // and may not be valid after the scheduler processes the graph
-            ggml_tensor* tensor = ggml_graph_get_tensor(gf, name.c_str());
+            ggml_tensor* tensor = item.second;  // Use stored pointer directly (marked as output!)
 
             if (!tensor) {
-                LOG_WRN("Warning: Tensor '%s' not found in computed graph, skipping\n", name.c_str());
+                LOG_WRN("Warning: Null tensor for '%s', skipping\n", name.c_str());
                 continue;
             }
 
@@ -5700,11 +5698,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 shape.push_back(tensor->ne[i]);
             }
 
-            // Read directly into float vector (matching working debug code pattern)
+            // Read directly into float vector (matching ggml_easy pattern)
             std::vector<float> data_f32(nelements);
 
             if (tensor->type == GGML_TYPE_F32) {
-                // Read directly into float vector (same as working debug code at line 5382)
+                // Read directly into float vector (same as ggml_easy line 342)
                 ggml_backend_tensor_get(tensor, data_f32.data(), 0, nbytes);
             } else if (tensor->type == GGML_TYPE_F16) {
                 // For F16, we need to convert
