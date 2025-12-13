@@ -944,7 +944,17 @@ struct clip_graph {
             REGISTER_DEBUG(debug_name, scores);
         }
 
+        // CRITICAL FIX: ggml_soft_max applies over dimension 0, but we need it over dimension 1 (keys)
+        // Permute [N, M, n_head, B] -> [M, N, n_head, B] to move keys to dim 0
+        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3);
+        scores = ggml_cont(ctx0, scores);
+
+        // Now apply softmax over dimension 0 (which is M, the keys)
         scores = ggml_soft_max(ctx0, scores);
+
+        // Permute back [M, N, n_head, B] -> [N, M, n_head, B]
+        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3);
+        scores = ggml_cont(ctx0, scores);
 
         // Debug scores after softmax for blocks 50 and 52
         if (block_idx == 50 || block_idx == 52) {
