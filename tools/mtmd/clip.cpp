@@ -5676,9 +5676,54 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         return false;
     }
 
+    // GGML_EASY STYLE DEBUG: Print tensors immediately after computation (like ggml_easy::compute())
+    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+        LOG_INF("\n=== GGML_EASY STYLE DEBUG: Printing tensors immediately after computation ===\n");
+        for (const auto& item : ctx->debug_intermediate_tensors) {
+            const std::string& name = item.first;
+            ggml_tensor* t = item.second;
+
+            if (!t) continue;
+
+            // Print shape (like ggml_easy::debug::print_tensor_shape)
+            LOG_INF("%s.shape = [", t->name);
+            for (int i = 0; i < ggml_n_dims(t); ++i) {
+                LOG_INF("%" PRId64, t->ne[i]);
+                if (i < ggml_n_dims(t) - 1) LOG_INF(", ");
+            }
+            LOG_INF("]\n");
+
+            // Read data and print (like ggml_easy::compute() does)
+            std::vector<uint8_t> data(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+
+            // Print first few values (like ggml_easy::debug::print_tensor_data)
+            ggml_type type = t->type;
+            int64_t* ne = t->ne;
+            size_t* nb = t->nb;
+
+            LOG_INF("%s.data (first row): [", t->name);
+            int n_print = std::min((int64_t)10, ne[0]);
+            for (int i0 = 0; i0 < n_print; i0++) {
+                size_t i = i0 * nb[0];
+                float v;
+                if (type == GGML_TYPE_F16) {
+                    v = ggml_fp16_to_fp32(*(ggml_fp16_t*)&data[i]);
+                } else if (type == GGML_TYPE_F32) {
+                    v = *(float*)&data[i];
+                } else {
+                    v = 0.0f;
+                }
+                LOG_INF("%8.4f", v);
+                if (i0 < n_print - 1) LOG_INF(", ");
+            }
+            LOG_INF("]\n\n");
+        }
+    }
+
     // CRITICAL: Read tensor data IMMEDIATELY after computation while buffers are still valid
     // Store the data in memory before the scheduler potentially frees/reuses buffers
-    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
     std::vector<std::tuple<std::string, std::vector<float>, std::vector<int64_t>>> captured_tensors;
 
     if (save_tensors_env && atoi(save_tensors_env) == 1) {
