@@ -710,14 +710,44 @@ struct clip_graph {
     }
 
     // ------------------------------------------------------------------------
+    // Helper for Conv2dSame padding (asymmetric SAME padding like PyTorch/TF)
+    // ------------------------------------------------------------------------
+    ggml_tensor* pad_same_2d(ggml_tensor* inp, int kernel_h, int kernel_w, int stride_h, int stride_w, int dilation_h = 1, int dilation_w = 1) {
+        const int64_t ih = inp->ne[1];  // height
+        const int64_t iw = inp->ne[0];  // width
+
+        // Calculate output size (ceil division)
+        const int64_t oh = (ih + stride_h - 1) / stride_h;
+        const int64_t ow = (iw + stride_w - 1) / stride_w;
+
+        // Calculate padding needed
+        const int64_t pad_h = std::max((int64_t)0, (oh - 1) * stride_h + (kernel_h - 1) * dilation_h + 1 - ih);
+        const int64_t pad_w = std::max((int64_t)0, (ow - 1) * stride_w + (kernel_w - 1) * dilation_w + 1 - iw);
+
+        // Split padding asymmetrically
+        const int pad_h_top = pad_h / 2;
+        const int pad_h_bottom = pad_h - pad_h_top;
+        const int pad_w_left = pad_w / 2;
+        const int pad_w_right = pad_w - pad_w_left;
+
+        // Apply padding if needed
+        if (pad_h > 0 || pad_w > 0) {
+            // ggml_pad expects: pad_left, pad_right, pad_top, pad_bottom
+            inp = ggml_pad(ctx0, inp, pad_w_left, pad_w_right, pad_h_top, pad_h_bottom);
+        }
+
+        return inp;
+    }
+
+    // ------------------------------------------------------------------------
     // Edge Residual Block (Stage 0)
     // ------------------------------------------------------------------------
     ggml_tensor * build_edge_residual(ggml_tensor * inp, const mobilenetv5_block & block, int stride, int block_idx = -1) {
         ggml_tensor * cur = inp;
 
-        // 1. Expansion Conv (3x3) - Already correct shape {3, 3, Cin, Cout}
-        int pad = 1;
-        cur = ggml_conv_2d(ctx0, block.s0_conv_exp_w, cur, stride, stride, pad, pad, 1, 1);
+        // 1. Expansion Conv (3x3) - Conv2dSame with stride=2 for first block
+        cur = pad_same_2d(cur, 3, 3, stride, stride);  // Apply SAME padding
+        cur = ggml_conv_2d(ctx0, block.s0_conv_exp_w, cur, stride, stride, 0, 0, 1, 1);  // padding=0
         if (block.s0_bn1_w) cur = rms_norm_2d(cur, block.s0_bn1_w);
         cur = ggml_gelu(ctx0, cur);
 
@@ -760,10 +790,11 @@ struct clip_graph {
 
         // 3. Depthwise Mid (Optional)
         // NOTE: dw_mid is where downsampling happens (stride=2 for first block of stage)
+        // Uses Conv2dSame when stride=2
         if (block.dw_mid_w) {
             int k = block.dw_mid_w->ne[0]; // 3 or 5
-            int p = k / 2;
-            cur = ggml_conv_2d_dw(ctx0, block.dw_mid_w, cur, stride, stride, p, p, 1, 1);
+            cur = pad_same_2d(cur, k, k, stride, stride);  // Apply SAME padding
+            cur = ggml_conv_2d_dw(ctx0, block.dw_mid_w, cur, stride, stride, 0, 0, 1, 1);  // padding=0
             if (block.dw_mid_bn_w) cur = rms_norm_2d(cur, block.dw_mid_bn_w);
             cur = ggml_gelu(ctx0, cur);
         }
@@ -827,10 +858,12 @@ struct clip_graph {
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
 
         // --- 2. K Calculation (Downsampled) ---
+        // Uses Conv2dSame(640, 640, kernel_size=(3, 3), stride=(2, 2), groups=640)
         ggml_tensor * k_inp = cur;
         if (block.attn_k_dw_w) {
-            int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
-            k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
+            int k_size = block.attn_k_dw_w->ne[0];  // Usually 3
+            k_inp = pad_same_2d(cur, k_size, k_size, 2, 2);  // Apply SAME padding
+            k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, k_inp, 2, 2, 0, 0, 1, 1);  // padding=0
             if (block.attn_k_norm_w) {
                 k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w, 1e-6f, block_idx);
             }
@@ -838,10 +871,12 @@ struct clip_graph {
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
         // --- 3. V Calculation (Downsampled) ---
+        // Uses Conv2dSame(640, 640, kernel_size=(3, 3), stride=(2, 2), groups=640)
         ggml_tensor * v_inp = cur;
         if (block.attn_v_dw_w) {
-            int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
-            v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
+            int v_size = block.attn_v_dw_w->ne[0];  // Usually 3
+            v_inp = pad_same_2d(cur, v_size, v_size, 2, 2);  // Apply SAME padding
+            v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, v_inp, 2, 2, 0, 0, 1, 1);  // padding=0
             if (block.attn_v_norm_w) {
                 v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w, 1e-6f, block_idx);
             }
@@ -1000,8 +1035,9 @@ struct clip_graph {
         // This will be saved as "inp_raw_from_graph" to distinguish from the direct vector save
         REGISTER_DEBUG("inp_raw_from_graph", inp);
 
-        // 1. Stem
-        ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
+        // 1. Stem - Conv2dSame(3, 64, kernel_size=(3, 3), stride=(2, 2))
+        ggml_tensor * cur = pad_same_2d(inp, 3, 3, 2, 2);  // Apply SAME padding
+        cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, cur, 2, 2, 0, 0, 1, 1);  // padding=0
         if (model.mobilenet_stem_conv_b) {
             cur = ggml_add(ctx0, cur, model.mobilenet_stem_conv_b);
         }
