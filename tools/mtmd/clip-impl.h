@@ -7,6 +7,7 @@
 #include <cstdarg>
 #include <cinttypes>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <map>
 #include <sstream>
@@ -544,17 +545,36 @@ static void save_tensor_to_npy(ggml_tensor * t, const std::string & filepath, gg
         return;
     }
 
+    // Verify tensor is valid
+    int64_t nelements = ggml_nelements(t);
+    size_t nbytes = ggml_nbytes(t);
+
+    if (nelements <= 0 || nbytes == 0) {
+        LOG_ERR("Invalid tensor dimensions for %s: nelements=%" PRId64 ", nbytes=%zu\n",
+                t->name, nelements, nbytes);
+        fclose(file);
+        return;
+    }
+
     // Get tensor data
-    std::vector<uint8_t> data(ggml_nbytes(t));
+    std::vector<uint8_t> data(nbytes);
     if (backend) {
-        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+        // Read tensor data from backend (GPU or CPU)
+        // This ensures we get the actual computed values
+        ggml_backend_tensor_get(t, data.data(), 0, nbytes);
     } else {
-        memcpy(data.data(), t->data, ggml_nbytes(t));
+        // Fallback: read from CPU memory if no backend
+        if (!t->data) {
+            LOG_ERR("Tensor %s has no data pointer and no backend\n", t->name);
+            fclose(file);
+            return;
+        }
+        memcpy(data.data(), t->data, nbytes);
     }
 
     // Convert to float32 for compatibility with PyTorch debug outputs
-    std::vector<float> data_f32(ggml_nelements(t));
-    for (int64_t i = 0; i < ggml_nelements(t); i++) {
+    std::vector<float> data_f32(nelements);
+    for (int64_t i = 0; i < nelements; i++) {
         if (t->type == GGML_TYPE_F32) {
             data_f32[i] = ((float*)data.data())[i];
         } else if (t->type == GGML_TYPE_F16) {
@@ -564,6 +584,31 @@ static void save_tensor_to_npy(ggml_tensor * t, const std::string & filepath, gg
             fclose(file);
             return;
         }
+    }
+
+    // Validate data - check for common issues
+    // Sample first few values to verify they're not all zeros or garbage
+    bool all_zeros = true;
+    bool has_extreme_values = false;
+    const int sample_size = std::min((int64_t)100, nelements);
+
+    for (int i = 0; i < sample_size; i++) {
+        float val = data_f32[i];
+        if (val != 0.0f) {
+            all_zeros = false;
+        }
+        // Check for extreme values that might indicate uninitialized memory
+        if (std::isnan(val) || std::isinf(val) || std::abs(val) > 1e10f) {
+            has_extreme_values = true;
+        }
+    }
+
+    if (all_zeros) {
+        LOG_WRN("Warning: Tensor '%s' contains all zeros (sampled %d/%"  PRId64 " elements)\n",
+                t->name, sample_size, nelements);
+    }
+    if (has_extreme_values) {
+        LOG_WRN("Warning: Tensor '%s' contains extreme/invalid values (NaN, Inf, or >1e10)\n", t->name);
     }
 
     // Build header dictionary

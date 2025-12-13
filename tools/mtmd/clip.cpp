@@ -17,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 #include <cinttypes>
@@ -597,7 +598,44 @@ struct clip_graph {
 
     // Helper: Normalize over the Channel dimension (dim 2 in [W, H, C, B])
     // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
-    ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f) {
+    ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f, int debug_block_idx = -1) {
+
+                // Debug helper
+        auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) {
+            if (!t) {
+                fprintf(stderr, "DEBUG: %s is NULL\n", label);
+                return;
+            }
+            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n",
+                label, ggml_type_name(t->type),
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        };
+
+        // Helper to register tensor for debugging
+        // CRITICAL: Follow ggml_easy::debug_print pattern EXACTLY
+        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
+            // If tensor has flags (input/output/etc), we need to COPY it first
+            // This is what ggml_easy does to prevent corrupting the graph
+            if (t->flags) {
+                // Create a copy: ggml_cpy(gf_ctx, t, ggml_dup_tensor(gf_ctx, t))
+                t = ggml_cpy(ctx0, t, ggml_dup_tensor(ctx0, t));
+            }
+
+            // Set the name
+            ggml_set_name(t, name.c_str());
+
+            // Mark as output - tells scheduler to preserve this tensor's data
+            ggml_set_output(t);
+
+            // CRITICAL: Add to graph with ggml_build_forward_expand
+            // This is what ggml_easy::mark_output does!
+            ggml_build_forward_expand(gf, t);
+
+            // Store the tensor pointer - we'll read its data after computation
+            ctx->debug_intermediate_tensors.push_back({name, t});
+        };
+
+
         // inp: [W, H, C, B]
         const int64_t W = inp->ne[0];
         const int64_t H = inp->ne[1];
@@ -614,14 +652,35 @@ struct clip_graph {
         // Reshape to [C, W*H*B] for RMS norm
         cur = ggml_reshape_2d(ctx0, cur, C, W * H * B);
 
+        // Debug before rms_norm for blocks 33, 50 and 52
+        if (debug_block_idx == 33 || debug_block_idx == 50 || debug_block_idx == 52) {
+            char debug_name[128];
+            snprintf(debug_name, sizeof(debug_name), "block%d_before_rms_norm", debug_block_idx);
+            REGISTER_DEBUG(debug_name, cur);
+        }
+
         // Apply RMS Norm (normalizes first dimension C)
         cur = ggml_rms_norm(ctx0, cur, eps);
+
+        // Debug after rms_norm for blocks 33, 50 and 52
+        if (debug_block_idx == 33 || debug_block_idx == 50 || debug_block_idx == 52) {
+            char debug_name[128];
+            snprintf(debug_name, sizeof(debug_name), "block%d_after_rms_norm", debug_block_idx);
+            REGISTER_DEBUG(debug_name, cur);
+        }
 
         // Apply weight (Scale)
         if (weight) {
             // weight is [C], cur is [C, W*H*B]
             // ggml_mul will broadcast along the second dimension
             cur = ggml_mul(ctx0, cur, weight);
+
+            // Debug after weight multiplication for blocks 33, 50 and 52
+            if (debug_block_idx == 33 || debug_block_idx == 50 || debug_block_idx == 52) {
+                char debug_name[128];
+                snprintf(debug_name, sizeof(debug_name), "block%d_after_norm_weight_mul", debug_block_idx);
+                REGISTER_DEBUG(debug_name, cur);
+            }
         }
 
         // Reshape back to [C, W*H, B]
@@ -739,118 +798,152 @@ struct clip_graph {
     // ------------------------------------------------------------------------
     // MobileNet Multi-Query Attention (MQA) - Corrected
     // ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+    // MobileNet Multi-Query Attention (MQA) - Corrected & Optimized
+    // ------------------------------------------------------------------------
     ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block, int block_idx = -1) {
-        ggml_tensor * cur = inp;
 
-        if (block.attn_norm_w) {
-            cur = rms_norm_2d(cur, block.attn_norm_w);
+        // ... [Debug Helpers kept same as original] ...
+        auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) { /* ... */ };
+        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) { /* ... */ };
+
+        // Debug input
+        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
+            char debug_name[128];
+            snprintf(debug_name, sizeof(debug_name), "block%d_input", block_idx);
+            REGISTER_DEBUG(debug_name, inp);
         }
 
-        // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
+        ggml_tensor * cur = inp;
+
+        // --- Norm ---
+        if (block.attn_norm_w) {
+            cur = rms_norm_2d(cur, block.attn_norm_w, 1e-6f, block_idx);
+        }
+
+        // --- 1. Q Calculation ---
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
 
-        // 2. K Calculation (Downsampled)
+        // --- 2. K Calculation (Downsampled) ---
         ggml_tensor * k_inp = cur;
         if (block.attn_k_dw_w) {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_k_norm_w) {
-                k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
+                k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w, 1e-6f, block_idx);
             }
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
-        // 3. V Calculation (Downsampled)
+        // --- 3. V Calculation (Downsampled) ---
         ggml_tensor * v_inp = cur;
         if (block.attn_v_dw_w) {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_v_norm_w) {
-                v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+                v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w, 1e-6f, block_idx);
             }
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
-        // --- Reshape & Permute Logic (Corrected for memory layout) ---
-        // Conv2d output layout: [W, H, C, B] where W is fastest dimension
-        // Collapse spatial dimensions (W*H) first to respect memory layout
+        // --- Reshape & Permute Logic ---
 
         const int W = cur->ne[0]; const int H = cur->ne[1]; const int B = cur->ne[3];
-        const int D = k->ne[2]; // Head dimension (single head for K/V in MQA)
+        const int D = k->ne[2]; // Head dimension
         const int n_head = q->ne[2] / D;
-        const int N = W * H; // Number of query positions
+        const int N = W * H;
 
         // Process Q: [W, H, D*n_head, B] -> [D, N, n_head, B]
-        q = ggml_reshape_3d(ctx0, q, W*H, D*n_head, B);        // [N, D*n_head, B]
-        q = ggml_reshape_4d(ctx0, q, W*H, D, n_head, B);       // [N, D, n_head, B]
-        q = ggml_permute(ctx0, q, 1, 0, 2, 3);                 // [D, N, n_head, B]
+        q = ggml_reshape_3d(ctx0, q, N, D*n_head, B);
+        q = ggml_reshape_4d(ctx0, q, N, D, n_head, B);
+        q = ggml_permute(ctx0, q, 1, 0, 2, 3); // [D, N, n_head, B]
         q = ggml_cont(ctx0, q);
 
         const int Wk = k->ne[0]; const int Hk = k->ne[1];
-        const int M = Wk * Hk; // Number of key/value tokens
+        const int M = Wk * Hk; 
 
         // Process K: [Wk, Hk, D, B] -> [D, M, 1, B]
-        k = ggml_reshape_3d(ctx0, k, M, D, B);                 // [M, D, B]
-        k = ggml_reshape_4d(ctx0, k, M, D, 1, B);              // [M, D, 1, B]
-        k = ggml_permute(ctx0, k, 1, 0, 2, 3);                 // [D, M, 1, B]
+        k = ggml_reshape_3d(ctx0, k, M, D, B);
+        k = ggml_reshape_4d(ctx0, k, M, D, 1, B);
+        k = ggml_permute(ctx0, k, 1, 0, 2, 3); // [D, M, 1, B]
         k = ggml_cont(ctx0, k);
 
         // Process V: [Wk, Hk, D, B] -> [M, D, 1, B]
-        v = ggml_reshape_3d(ctx0, v, M, D, B);                 // [M, D, B]
-        v = ggml_reshape_4d(ctx0, v, M, D, 1, B);              // [M, D, 1, B]
-        v = ggml_cont(ctx0, v);                                 // Keep as [M, D, 1, B]
+        // NOTE: We keep V as [M, D] because ggml_mul_mat expects src0^T * src1.
+        // To get output [D, N], we will need [M, D]^T * [M, N].
+        v = ggml_reshape_3d(ctx0, v, M, D, B);
+        v = ggml_reshape_4d(ctx0, v, M, D, 1, B);
+        v = ggml_cont(ctx0, v); // [M, D, 1, B]
 
         // --- Multi-Query Attention ---
-        // Following PyTorch scaled_dot_product_attention logic:
-        // attn = softmax(q @ k.T * scale)
-        // out = attn @ v
-
         float scale = 1.0f / sqrtf((float)D);
 
-        // Step 1: Broadcast K to all heads: [D, M, 1, B] -> [D, M, n_head, B]
-        ggml_tensor * k_broadcast = ggml_repeat(ctx0, k, q);
+        // Step 1: Compute Q @ K.T
+        // Q: [D, N, n_head, B]
+        // K: [D, M, 1, B]
+        // ggml_mul_mat computes K^T * Q  -> [D, M]^T * [D, N] -> [M, D] * [D, N] -> [M, N]
+        // Implicit Broadcast: K has 1 head, Q has n_head. ggml handles this automatically.
+        ggml_tensor * scores = ggml_mul_mat(ctx0, k, q); // Result: [N, M, n_head, B] (in ggml layout)
 
-        // Step 2: Compute Q @ K.T -> attention scores
-        // q: [D, N, n_head, B], k_broadcast: [D, M, n_head, B]
-        // Result: [N, M, n_head, B]
-        ggml_tensor * scores = ggml_mul_mat(ctx0, k_broadcast, q);
+        // Debug scores
+        if (block_idx == 33) {
+             char debug_name[128];
+             snprintf(debug_name, sizeof(debug_name), "block%d_scores_raw", block_idx);
+             REGISTER_DEBUG(debug_name, scores);
+        }
+
         scores = ggml_scale(ctx0, scores, scale);
+
+        // Step 2: Softmax
+        // scores is currently [N, M, n_head, B] (ne0=N, ne1=M)
+        // We need softmax over M (keys). 
+        // ggml_soft_max applies to dim 0. We need to swap N and M.
+        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3); // [M, N, n_head, B]
+        scores = ggml_cont(ctx0, scores);
         scores = ggml_soft_max(ctx0, scores);
 
-        // Step 3: Broadcast V to all heads by matching k_broadcast's dimension order
-        // First permute V from [M, D, 1, B] to [D, M, 1, B] to match k_broadcast
-        v = ggml_permute(ctx0, v, 1, 0, 2, 3); // [D, M, 1, B]
-        v = ggml_cont(ctx0, v);
+        // Permute 
+        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3); // [N, M, n_head, B]
+        scores = ggml_cont(ctx0, scores);
 
-        // Step 4: Broadcast V over heads: [D, M, 1, B] -> [D, M, n_head, B]
-        // Now dimensions match k_broadcast [D, M, n_head, B] except for dim 2
-        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, k_broadcast);
+        // v = ggml_permute(ctx0, v, 1, 0, 2, 3); 
+        // v = ggml_cont(ctx0, v);
 
-        // Step 5: Permute V back to [M, D, n_head, B] for multiplication
-        v_broadcast = ggml_permute(ctx0, v_broadcast, 1, 0, 2, 3); // [M, D, n_head, B]
-        v_broadcast = ggml_cont(ctx0, v_broadcast);
+        // Step 3: Compute Attn @ V
+        // V:      [M, D, 1, B] (ne0=M, ne1=D)
+        // Scores: [M, N, n_head, B] (ne0=M, ne1=N)
+        //
+        // ggml_mul_mat computes V^T * Scores -> [M, D]^T * [M, N] -> [D, M] * [M, N] -> [D, N]
+        // Implicit Broadcast: V has 1 head, Scores has n_head. ggml handles this automatically.
+        
+        // FIX: Removed v_broadcast and ggml_repeat logic. Using implicit broadcast.
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, scores); // Result: [N, D, n_head, B]
 
-        // Step 6: Compute attn @ V -> output
-        // scores: [M, N, n_head, B], v_broadcast: [M, D, n_head, B]
-        // Result: [D, N, n_head, B]
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_broadcast, scores);
+        // Debug kqv
+        if (block_idx == 33) {
+             char debug_name[128];
+             snprintf(debug_name, sizeof(debug_name), "block%d_kqv_out", block_idx);
+             REGISTER_DEBUG(debug_name, kqv);
+        }
 
         // --- Reshape back to spatial layout ---
-        // kqv is already [D, N, n_head, B], reshape to [N, D, n_head, B] then to spatial
-        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3);            // [N, D, n_head, B]
+        // kqv is [N, D, n_head, B]. We want [D, N, n_head, B] to merge heads.
+        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3); // [D, N, n_head, B]
         kqv = ggml_cont(ctx0, kqv);
-        kqv = ggml_reshape_3d(ctx0, kqv, N, D * n_head, B);  // [N, D*n_head, B]
-        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D * n_head, B); // [W, H, D*n_head, B]
+        
+        // Reshape to [N, D*n_head, B] then [W, H, C, B]
+        kqv = ggml_reshape_3d(ctx0, kqv, N, D * n_head, B);
+        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D * n_head, B);
         kqv = ggml_cont(ctx0, kqv);
 
         // Output projection
         cur = ggml_conv_2d(ctx0, block.attn_o_w, kqv, 1, 1, 0, 0, 1, 1);
 
-        // Apply layer_scale and residual connection
+        // Residual & Layer Scale
         if (inp->ne[0] == cur->ne[0] && inp->ne[2] == cur->ne[2]) {
             if (block.layer_scale_w) {
                 ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
-                scaled = ggml_cont(ctx0, scaled);  // Make contiguous before mul
+                scaled = ggml_cont(ctx0, scaled);
                 ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
                     1, block.layer_scale_w->ne[0], 1, 1);
                 scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
@@ -885,7 +978,26 @@ struct clip_graph {
         };
 
         // Helper to register tensor for debugging
+        // CRITICAL: Follow ggml_easy::debug_print pattern EXACTLY
         auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
+            // If tensor has flags (input/output/etc), we need to COPY it first
+            // This is what ggml_easy does to prevent corrupting the graph
+            if (t->flags) {
+                // Create a copy: ggml_cpy(gf_ctx, t, ggml_dup_tensor(gf_ctx, t))
+                t = ggml_cpy(ctx0, t, ggml_dup_tensor(ctx0, t));
+            }
+
+            // Set the name
+            ggml_set_name(t, name.c_str());
+
+            // Mark as output - tells scheduler to preserve this tensor's data
+            ggml_set_output(t);
+
+            // CRITICAL: Add to graph with ggml_build_forward_expand
+            // This is what ggml_easy::mark_output does!
+            ggml_build_forward_expand(gf, t);
+
+            // Store the tensor pointer - we'll read its data after computation
             ctx->debug_intermediate_tensors.push_back({name, t});
         };
 
@@ -893,7 +1005,9 @@ struct clip_graph {
 
         ggml_tensor * inp = build_inp_raw();
         DEBUG_SHAPE("Input Raw", inp);
-        // Note: inp_raw is saved directly from the vector in clip_image_batch_encode()
+        // Register inp_raw to test if ggml_backend_tensor_get works for input tensors
+        // This will be saved as "inp_raw_from_graph" to distinguish from the direct vector save
+        REGISTER_DEBUG("inp_raw_from_graph", inp);
 
         // 1. Stem
         ggml_tensor * cur = ggml_conv_2d(ctx0, model.mobilenet_stem_conv_w, inp, 2, 2, 1, 1, 1, 1);
@@ -931,6 +1045,16 @@ struct clip_graph {
         for (int i = 0; i < total_blocks; i++) {
             const auto & block = model.mobilenet_blocks[i];
             int stride = is_stage_start(i) ? 2 : 1;
+
+            // Debug block type
+            const char* block_type = block.s0_conv_exp_w ? "edge_residual" :
+                                      block.attn_q_w ? "attention" : "inverted_residual";
+
+            // Debug input for problematic blocks
+            if (i >= 50 && i <= 54) {
+                fprintf(stderr, "DEBUG: Block %d (%s) input shape: [%ld, %ld, %ld, %ld], stride=%d\n",
+                        i, block_type, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3], stride);
+            }
 
             if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride, i);
             else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block, i);
@@ -4947,7 +5071,7 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 // Resize to 768x768 using bilinear interpolation, then rescale to f32
                 clip_image_u8 resized_image;
                 int sz = params.image_size;
-                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BILINEAR, false);
+                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BICUBIC, false);
                 clip_image_f32_ptr img_f32(clip_image_f32_init());
                 rescale_image_u8_to_f32(resized_image, *img_f32);
                 res_imgs->entries.push_back(std::move(img_f32));
@@ -5366,8 +5490,25 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         }
         set_input_f32("inp_raw", inp_raw);
 
-        // Save inp_raw vector directly for debugging
+        // DEBUG: Test if ggml_backend_tensor_get works immediately after set
         const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+        if (save_tensors_env && atoi(save_tensors_env) == 1) {
+            ggml_tensor* inp_raw_tensor = get_inp_tensor("inp_raw");
+            LOG_INF("*** DEBUG inp_raw IMMEDIATELY after set_input_f32 ***\n");
+            LOG_INF("  Tensor dims: [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    inp_raw_tensor->ne[0], inp_raw_tensor->ne[1], inp_raw_tensor->ne[2], inp_raw_tensor->ne[3]);
+            LOG_INF("  Vector size: %zu\n", inp_raw.size());
+
+            std::vector<float> test_read(100);  // Read first 100 values
+            ggml_backend_tensor_get(inp_raw_tensor, test_read.data(), 0, 100 * sizeof(float));
+            LOG_INF("  First 10 values after set_input_f32:\n");
+            for (int i = 0; i < 10; i++) {
+                LOG_INF("    [%d] read=%.6f expected=%.6f %s\n", i, test_read[i], inp_raw[i],
+                        (test_read[i] == inp_raw[i]) ? "✓" : "✗");
+            }
+        }
+
+        // Save inp_raw vector directly for debugging
         if (save_tensors_env && atoi(save_tensors_env) == 1) {
             const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
             std::string output_path = output_dir ? output_dir : "debug_ggml_output";
@@ -5649,6 +5790,134 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         return false;
     }
 
+    // GGML_EASY STYLE DEBUG: Print tensors immediately after computation (like ggml_easy::compute())
+    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
+    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+        LOG_INF("\n=== GGML_EASY STYLE DEBUG: Printing tensors immediately after computation ===\n");
+        for (const auto& item : ctx->debug_intermediate_tensors) {
+            const std::string& name = item.first;
+            ggml_tensor* t = item.second;
+
+            if (!t) continue;
+
+            // Print shape (like ggml_easy::debug::print_tensor_shape)
+            LOG_INF("%s.shape = [", t->name);
+            for (int i = 0; i < ggml_n_dims(t); ++i) {
+                LOG_INF("%" PRId64, t->ne[i]);
+                if (i < ggml_n_dims(t) - 1) LOG_INF(", ");
+            }
+            LOG_INF("]\n");
+
+            // Read data and print (like ggml_easy::compute() does)
+            std::vector<uint8_t> data(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+
+            // Print first few values (like ggml_easy::debug::print_tensor_data)
+            ggml_type type = t->type;
+            int64_t* ne = t->ne;
+            size_t* nb = t->nb;
+
+            LOG_INF("%s.data (first row): [", t->name);
+            int n_print = std::min((int64_t)10, ne[0]);
+            for (int i0 = 0; i0 < n_print; i0++) {
+                size_t i = i0 * nb[0];
+                float v;
+                if (type == GGML_TYPE_F16) {
+                    v = ggml_fp16_to_fp32(*(ggml_fp16_t*)&data[i]);
+                } else if (type == GGML_TYPE_F32) {
+                    v = *(float*)&data[i];
+                } else {
+                    v = 0.0f;
+                }
+                LOG_INF("%8.4f", v);
+                if (i0 < n_print - 1) LOG_INF(", ");
+            }
+            LOG_INF("]\n\n");
+        }
+    }
+
+    // CRITICAL: Read tensor data IMMEDIATELY after computation while buffers are still valid
+    // Store the data in memory before the scheduler potentially frees/reuses buffers
+    std::vector<std::tuple<std::string, std::vector<float>, std::vector<int64_t>>> captured_tensors;
+
+    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+        LOG_INF("\n=== Capturing intermediate tensor data immediately after computation ===\n");
+
+        for (const auto& item : ctx->debug_intermediate_tensors) {
+            const std::string& name = item.first;
+            ggml_tensor* tensor = item.second;  // Use stored pointer directly (marked as output!)
+
+            if (!tensor) {
+                LOG_WRN("Warning: Null tensor for '%s', skipping\n", name.c_str());
+                continue;
+            }
+
+            // Read the tensor data RIGHT NOW while backend buffers are still valid
+            int64_t nelements = ggml_nelements(tensor);
+            size_t nbytes = ggml_nbytes(tensor);
+
+            // Store shape first
+            int ndims = ggml_n_dims(tensor);
+            std::vector<int64_t> shape;
+            for (int i = ndims - 1; i >= 0; i--) {  // Reverse for NumPy
+                shape.push_back(tensor->ne[i]);
+            }
+
+            // Read directly into float vector (matching ggml_easy pattern)
+            std::vector<float> data_f32(nelements);
+
+            if (tensor->type == GGML_TYPE_F32) {
+                // Read directly into float vector (same as ggml_easy line 342)
+                ggml_backend_tensor_get(tensor, data_f32.data(), 0, nbytes);
+            } else if (tensor->type == GGML_TYPE_F16) {
+                // For F16, we need to convert
+                std::vector<ggml_fp16_t> data_f16(nelements);
+                ggml_backend_tensor_get(tensor, data_f16.data(), 0, nbytes);
+                for (int64_t i = 0; i < nelements; i++) {
+                    data_f32[i] = ggml_fp16_to_fp32(data_f16[i]);
+                }
+            } else {
+                LOG_WRN("Warning: Unsupported tensor type %s for '%s', skipping\n",
+                        ggml_type_name(tensor->type), name.c_str());
+                continue;
+            }
+
+            // Save to captured_tensors for later writing
+            captured_tensors.push_back(std::make_tuple(name, data_f32, shape));
+
+            // Debug: Print detailed info for inp_raw_from_graph
+            if (name == "inp_raw_from_graph") {
+                LOG_INF("  *** DEBUG inp_raw_from_graph ***\n");
+                LOG_INF("    Tensor dims: [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+                LOG_INF("    Saved shape: [");
+                for (size_t i = 0; i < shape.size(); i++) {
+                    LOG_INF("%" PRId64, shape[i]);
+                    if (i < shape.size() - 1) LOG_INF(", ");
+                }
+                LOG_INF("]\n");
+                LOG_INF("    Total elements: %zu\n", data_f32.size());
+                LOG_INF("    First 10 values: ");
+                for (int i = 0; i < 10 && i < (int)data_f32.size(); i++) {
+                    LOG_INF("%.6f ", data_f32[i]);
+                }
+                LOG_INF("\n");
+                // Find min/max
+                float min_val = data_f32[0], max_val = data_f32[0];
+                for (const auto& v : data_f32) {
+                    if (v < min_val) min_val = v;
+                    if (v > max_val) max_val = v;
+                }
+                LOG_INF("    Value range: [%.6f, %.6f]\n", min_val, max_val);
+            }
+
+            LOG_INF("  Captured tensor '%s' (%zu elements, type=%s)\n",
+                    name.c_str(), data_f32.size(), ggml_type_name(tensor->type));
+        }
+
+        LOG_INF("=== Captured %zu tensors ===\n\n", captured_tensors.size());
+    }
+
     // print debug nodes
     if (ctx->debug_graph) {
         LOG_INF("\n\n---\n\n");
@@ -5661,10 +5930,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         }
     }
 
-    // Save intermediate tensors to .npy files for debugging (Gemma 3n Vision)
-    // Set environment variable CLIP_DEBUG_SAVE_TENSORS=1 to enable
-    const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
-    if (save_tensors_env && atoi(save_tensors_env) == 1) {
+    // Write captured tensor data to .npy files
+    // This happens AFTER the critical immediate capture above
+    if (save_tensors_env && atoi(save_tensors_env) == 1 && !captured_tensors.empty()) {
         const char* output_dir = getenv("CLIP_DEBUG_OUTPUT_DIR");
         std::string output_path = output_dir ? output_dir : "debug_ggml_output";
 
@@ -5675,22 +5943,18 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         mkdir(output_path.c_str(), 0755);
         #endif
 
-        LOG_INF("\n=== Saving intermediate tensors to %s ===\n", output_path.c_str());
+        LOG_INF("\n=== Writing captured tensors to disk: %s ===\n", output_path.c_str());
 
-        // Iterate through registered debug tensors
-        for (const auto& item : ctx->debug_intermediate_tensors) {
-            const std::string& name = item.first;
-            ggml_tensor* tensor = item.second;
+        for (const auto& item : captured_tensors) {
+            const std::string& name = std::get<0>(item);
+            const std::vector<float>& data = std::get<1>(item);
+            const std::vector<int64_t>& shape = std::get<2>(item);
 
-            if (tensor) {
-                std::string filepath = output_path + "/debug_" + name + ".npy";
-                // Get backend for this tensor
-                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), tensor);
-                save_tensor_to_npy(tensor, filepath, backend);
-            }
+            std::string filepath = output_path + "/debug_" + name + ".npy";
+            save_vector_to_npy(data, shape, filepath);
         }
 
-        LOG_INF("=== Tensor saving complete (%zu tensors) ===\n\n", ctx->debug_intermediate_tensors.size());
+        LOG_INF("=== Successfully wrote %zu tensors to disk ===\n\n", captured_tensors.size());
     }
 
     // the last node is the embedding tensor
