@@ -885,7 +885,7 @@ struct clip_graph {
         // K: [D, M, 1, B]
         // ggml_mul_mat computes K^T * Q  -> [D, M]^T * [D, N] -> [M, D] * [D, N] -> [M, N]
         // Implicit Broadcast: K has 1 head, Q has n_head. ggml handles this automatically.
-        ggml_tensor * scores = ggml_mul_mat(ctx0, k, q); // Result: [N, M, n_head, B] (in ggml layout)
+        ggml_tensor * scores = ggml_mul_mat(ctx0, k, q); // Result: [M, N, n_head, B] (in ggml layout)
 
         // Debug scores
         if (block_idx == 33) {
@@ -897,19 +897,10 @@ struct clip_graph {
         scores = ggml_scale(ctx0, scores, scale);
 
         // Step 2: Softmax
-        // scores is currently [N, M, n_head, B] (ne0=N, ne1=M)
-        // We need softmax over M (keys). 
-        // ggml_soft_max applies to dim 0. We need to swap N and M.
-        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3); // [M, N, n_head, B]
-        scores = ggml_cont(ctx0, scores);
+        // scores is [M, N, n_head, B] (ne0=M, ne1=N)
+        // We need softmax over M (keys).
+        // ggml_soft_max applies to dim 0, which is M. Perfect - no permute needed!
         scores = ggml_soft_max(ctx0, scores);
-
-        // Permute 
-        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3); // [N, M, n_head, B]
-        scores = ggml_cont(ctx0, scores);
-
-        // v = ggml_permute(ctx0, v, 1, 0, 2, 3); 
-        // v = ggml_cont(ctx0, v);
 
         // Step 3: Compute Attn @ V
         // V:      [M, D, 1, B] (ne0=M, ne1=D)
@@ -917,8 +908,6 @@ struct clip_graph {
         //
         // ggml_mul_mat computes V^T * Scores -> [M, D]^T * [M, N] -> [D, M] * [M, N] -> [D, N]
         // Implicit Broadcast: V has 1 head, Scores has n_head. ggml handles this automatically.
-        
-        // FIX: Removed v_broadcast and ggml_repeat logic. Using implicit broadcast.
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, scores); // Result: [N, D, n_head, B]
 
         // Debug kqv
