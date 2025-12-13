@@ -599,6 +599,43 @@ struct clip_graph {
     // Helper: Normalize over the Channel dimension (dim 2 in [W, H, C, B])
     // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
     ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f, int debug_block_idx = -1) {
+
+                // Debug helper
+        auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) {
+            if (!t) {
+                fprintf(stderr, "DEBUG: %s is NULL\n", label);
+                return;
+            }
+            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n",
+                label, ggml_type_name(t->type),
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        };
+
+        // Helper to register tensor for debugging
+        // CRITICAL: Follow ggml_easy::debug_print pattern EXACTLY
+        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
+            // If tensor has flags (input/output/etc), we need to COPY it first
+            // This is what ggml_easy does to prevent corrupting the graph
+            if (t->flags) {
+                // Create a copy: ggml_cpy(gf_ctx, t, ggml_dup_tensor(gf_ctx, t))
+                t = ggml_cpy(ctx0, t, ggml_dup_tensor(ctx0, t));
+            }
+
+            // Set the name
+            ggml_set_name(t, name.c_str());
+
+            // Mark as output - tells scheduler to preserve this tensor's data
+            ggml_set_output(t);
+
+            // CRITICAL: Add to graph with ggml_build_forward_expand
+            // This is what ggml_easy::mark_output does!
+            ggml_build_forward_expand(gf, t);
+
+            // Store the tensor pointer - we'll read its data after computation
+            ctx->debug_intermediate_tensors.push_back({name, t});
+        };
+
+
         // inp: [W, H, C, B]
         const int64_t W = inp->ne[0];
         const int64_t H = inp->ne[1];
@@ -761,8 +798,16 @@ struct clip_graph {
     // ------------------------------------------------------------------------
     // MobileNet Multi-Query Attention (MQA) - Corrected
     // ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+    // MobileNet Multi-Query Attention (MQA) - Corrected & Optimized
+    // ------------------------------------------------------------------------
     ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block, int block_idx = -1) {
-        // Debug input to blocks 33, 50 and 52
+
+        // ... [Debug Helpers kept same as original] ...
+        auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) { /* ... */ };
+        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) { /* ... */ };
+
+        // Debug input
         if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
             char debug_name[128];
             snprintf(debug_name, sizeof(debug_name), "block%d_input", block_idx);
@@ -771,318 +816,141 @@ struct clip_graph {
 
         ggml_tensor * cur = inp;
 
+        // --- Norm ---
         if (block.attn_norm_w) {
-            // Debug the norm weight for blocks 33, 50 and 52
-            if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-                char debug_name[128];
-                snprintf(debug_name, sizeof(debug_name), "block%d_attn_norm_weight", block_idx);
-                REGISTER_DEBUG(debug_name, block.attn_norm_w);
-            }
-
             cur = rms_norm_2d(cur, block.attn_norm_w, 1e-6f, block_idx);
         }
 
-        // Debug after norm for blocks 33, 50 and 52
-        if ((block_idx == 33 || block_idx == 50 || block_idx == 52) && block.attn_norm_w) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_after_norm", block_idx);
-            REGISTER_DEBUG(debug_name, cur);
-        }
-
-        // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
+        // --- 1. Q Calculation ---
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
 
-        // Debug Q after conv for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_q_after_conv", block_idx);
-            REGISTER_DEBUG(debug_name, q);
-        }
-
-        // 2. K Calculation (Downsampled)
+        // --- 2. K Calculation (Downsampled) ---
         ggml_tensor * k_inp = cur;
         if (block.attn_k_dw_w) {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
-
-            // Debug for block 33
-            if (block_idx == 33) {
-                fprintf(stderr, "  Block 33: K downsampling DW weight exists, kernel=%ld, applying stride=%d\n",
-                        block.attn_k_dw_w->ne[0], stride);
-                fprintf(stderr, "  K input shape before DW: [%ld, %ld, %ld, %ld]\n",
-                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-            }
-
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
-
-            // Debug after downsampling
-            if (block_idx == 33) {
-                fprintf(stderr, "  K input shape after DW: [%ld, %ld, %ld, %ld]\n",
-                        k_inp->ne[0], k_inp->ne[1], k_inp->ne[2], k_inp->ne[3]);
-            }
-
             if (block.attn_k_norm_w) {
                 k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w, 1e-6f, block_idx);
             }
-        } else if (block_idx == 33) {
-            fprintf(stderr, "  Block 33 WARNING: K downsampling DW weight is NULL - K will NOT be downsampled!\n");
-            fprintf(stderr, "  K input shape (no downsampling): [%ld, %ld, %ld, %ld]\n",
-                    cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
-        // Debug K after conv for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_k_after_conv", block_idx);
-            REGISTER_DEBUG(debug_name, k);
-        }
-
-        // 3. V Calculation (Downsampled)
+        // --- 3. V Calculation (Downsampled) ---
         ggml_tensor * v_inp = cur;
         if (block.attn_v_dw_w) {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
-
-            // Debug for block 33
-            if (block_idx == 33) {
-                fprintf(stderr, "  Block 33: V downsampling DW weight exists, kernel=%ld, applying stride=%d\n",
-                        block.attn_v_dw_w->ne[0], stride);
-                fprintf(stderr, "  V input shape before DW: [%ld, %ld, %ld, %ld]\n",
-                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-            }
-
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
-
-            // Debug after downsampling
-            if (block_idx == 33) {
-                fprintf(stderr, "  V input shape after DW: [%ld, %ld, %ld, %ld]\n",
-                        v_inp->ne[0], v_inp->ne[1], v_inp->ne[2], v_inp->ne[3]);
-            }
-
             if (block.attn_v_norm_w) {
                 v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w, 1e-6f, block_idx);
             }
-        } else if (block_idx == 33) {
-            fprintf(stderr, "  Block 33 WARNING: V downsampling DW weight is NULL - V will NOT be downsampled!\n");
-            fprintf(stderr, "  V input shape (no downsampling): [%ld, %ld, %ld, %ld]\n",
-                    cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
-        // Debug V after conv for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_v_after_conv", block_idx);
-            REGISTER_DEBUG(debug_name, v);
-        }
-
-        // --- Reshape & Permute Logic (Corrected for memory layout) ---
-        // Conv2d output layout: [W, H, C, B] where W is fastest dimension
-        // Collapse spatial dimensions (W*H) first to respect memory layout
+        // --- Reshape & Permute Logic ---
 
         const int W = cur->ne[0]; const int H = cur->ne[1]; const int B = cur->ne[3];
-        const int D = k->ne[2]; // Head dimension (single head for K/V in MQA)
+        const int D = k->ne[2]; // Head dimension
         const int n_head = q->ne[2] / D;
-        const int N = W * H; // Number of query positions
-
-        // Debug for problematic blocks
-        if (block_idx == 33 || (block_idx >= 50 && block_idx <= 54)) {
-            const int Wk = k->ne[0]; const int Hk = k->ne[1];
-            const int M = Wk * Hk;
-            fprintf(stderr, "  ATTN Block %d: W=%d, H=%d, D=%d, n_head=%d, N=%d\n",
-                    block_idx, W, H, D, n_head, N);
-            fprintf(stderr, "  Q shape: [%ld, %ld, %ld, %ld]\n",
-                    q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
-            fprintf(stderr, "  K shape: [%ld, %ld, %ld, %ld], Wk=%d, Hk=%d, M=%d\n",
-                    k->ne[0], k->ne[1], k->ne[2], k->ne[3], Wk, Hk, M);
-            fprintf(stderr, "  V shape: [%ld, %ld, %ld, %ld]\n",
-                    v->ne[0], v->ne[1], v->ne[2], v->ne[3]);
-            fprintf(stderr, "  Expected attention scores shape: [%d, %d, %d] (N x M x n_head)\n",
-                    N, M, n_head);
-        }
+        const int N = W * H;
 
         // Process Q: [W, H, D*n_head, B] -> [D, N, n_head, B]
-        q = ggml_reshape_3d(ctx0, q, W*H, D*n_head, B);        // [N, D*n_head, B]
-        q = ggml_reshape_4d(ctx0, q, W*H, D, n_head, B);       // [N, D, n_head, B]
-        q = ggml_permute(ctx0, q, 1, 0, 2, 3);                 // [D, N, n_head, B]
+        q = ggml_reshape_3d(ctx0, q, N, D*n_head, B);
+        q = ggml_reshape_4d(ctx0, q, N, D, n_head, B);
+        q = ggml_permute(ctx0, q, 1, 0, 2, 3); // [D, N, n_head, B]
         q = ggml_cont(ctx0, q);
 
         const int Wk = k->ne[0]; const int Hk = k->ne[1];
-        const int M = Wk * Hk; // Number of key/value tokens
+        const int M = Wk * Hk; 
 
         // Process K: [Wk, Hk, D, B] -> [D, M, 1, B]
-        k = ggml_reshape_3d(ctx0, k, M, D, B);                 // [M, D, B]
-        k = ggml_reshape_4d(ctx0, k, M, D, 1, B);              // [M, D, 1, B]
-        k = ggml_permute(ctx0, k, 1, 0, 2, 3);                 // [D, M, 1, B]
+        k = ggml_reshape_3d(ctx0, k, M, D, B);
+        k = ggml_reshape_4d(ctx0, k, M, D, 1, B);
+        k = ggml_permute(ctx0, k, 1, 0, 2, 3); // [D, M, 1, B]
         k = ggml_cont(ctx0, k);
 
         // Process V: [Wk, Hk, D, B] -> [M, D, 1, B]
-        v = ggml_reshape_3d(ctx0, v, M, D, B);                 // [M, D, B]
-        v = ggml_reshape_4d(ctx0, v, M, D, 1, B);              // [M, D, 1, B]
-        v = ggml_cont(ctx0, v);                                 // Keep as [M, D, 1, B]
+        // NOTE: We keep V as [M, D] because ggml_mul_mat expects src0^T * src1.
+        // To get output [D, N], we will need [M, D]^T * [M, N].
+        v = ggml_reshape_3d(ctx0, v, M, D, B);
+        v = ggml_reshape_4d(ctx0, v, M, D, 1, B);
+        v = ggml_cont(ctx0, v); // [M, D, 1, B]
 
         // --- Multi-Query Attention ---
-        // Following PyTorch scaled_dot_product_attention logic:
-        // attn = softmax(q @ k.T * scale)
-        // out = attn @ v
-
         float scale = 1.0f / sqrtf((float)D);
 
-        // Debug intermediate tensors for blocks 33, 50 and 52 (for comparison)
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            fprintf(stderr, "  DEBUG Block %d: scale = %f (1/sqrt(%d))\n", block_idx, scale, D);
+        // Step 1: Compute Q @ K.T
+        // Q: [D, N, n_head, B]
+        // K: [D, M, 1, B]
+        // ggml_mul_mat computes K^T * Q  -> [D, M]^T * [D, N] -> [M, D] * [D, N] -> [M, N]
+        // Implicit Broadcast: K has 1 head, Q has n_head. ggml handles this automatically.
+        ggml_tensor * scores = ggml_mul_mat(ctx0, k, q); // Result: [N, M, n_head, B] (in ggml layout)
 
-            // Check the weights themselves
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_attn_q_weight", block_idx);
-            REGISTER_DEBUG(debug_name, block.attn_q_w);
-            snprintf(debug_name, sizeof(debug_name), "block%d_attn_k_weight", block_idx);
-            REGISTER_DEBUG(debug_name, block.attn_k_w);
-            snprintf(debug_name, sizeof(debug_name), "block%d_attn_v_weight", block_idx);
-            REGISTER_DEBUG(debug_name, block.attn_v_w);
-            snprintf(debug_name, sizeof(debug_name), "block%d_attn_o_weight", block_idx);
-            REGISTER_DEBUG(debug_name, block.attn_o_w);
-
-            // Also debug layer_scale weight if present
-            if (block.layer_scale_w) {
-                snprintf(debug_name, sizeof(debug_name), "block%d_layer_scale_weight", block_idx);
-                REGISTER_DEBUG(debug_name, block.layer_scale_w);
-            }
-
-            // Capture processed Q, K, V
-            snprintf(debug_name, sizeof(debug_name), "block%d_q_processed", block_idx);
-            REGISTER_DEBUG(debug_name, q);
-            snprintf(debug_name, sizeof(debug_name), "block%d_k_processed", block_idx);
-            REGISTER_DEBUG(debug_name, k);
-            snprintf(debug_name, sizeof(debug_name), "block%d_v_processed", block_idx);
-            REGISTER_DEBUG(debug_name, v);
-        }
-
-        // Step 1: Broadcast K to all heads: [D, M, 1, B] -> [D, M, n_head, B]
-        ggml_tensor * k_broadcast = ggml_repeat(ctx0, k, q);
-
-        // Debug k_broadcast for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_k_broadcast", block_idx);
-            REGISTER_DEBUG(debug_name, k_broadcast);
-        }
-
-        // Step 2: Compute Q @ K.T -> attention scores
-        // q: [D, N, n_head, B], k_broadcast: [D, M, n_head, B]
-        // Result: [N, M, n_head, B]
-        ggml_tensor * scores = ggml_mul_mat(ctx0, k_broadcast, q);
-
-        // Debug scores before scaling for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_scores_before_scale", block_idx);
-            REGISTER_DEBUG(debug_name, scores);
+        // Debug scores
+        if (block_idx == 33) {
+             char debug_name[128];
+             snprintf(debug_name, sizeof(debug_name), "block%d_scores_raw", block_idx);
+             REGISTER_DEBUG(debug_name, scores);
         }
 
         scores = ggml_scale(ctx0, scores, scale);
 
-        // Debug scores after scaling for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_scores_after_scale", block_idx);
-            REGISTER_DEBUG(debug_name, scores);
-        }
-
-        // CRITICAL FIX: ggml_soft_max applies over dimension 0, but we need it over dimension 1 (keys)
-        // Permute [N, M, n_head, B] -> [M, N, n_head, B] to move keys to dim 0
-        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3);
+        // Step 2: Softmax
+        // scores is currently [N, M, n_head, B] (ne0=N, ne1=M)
+        // We need softmax over M (keys). 
+        // ggml_soft_max applies to dim 0. We need to swap N and M.
+        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3); // [M, N, n_head, B]
         scores = ggml_cont(ctx0, scores);
-
-        // Now apply softmax over dimension 0 (which is M, the keys)
         scores = ggml_soft_max(ctx0, scores);
 
-        // Permute back [M, N, n_head, B] -> [N, M, n_head, B]
-        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3);
+        // Permute 
+        scores = ggml_permute(ctx0, scores, 1, 0, 2, 3); // [N, M, n_head, B]
         scores = ggml_cont(ctx0, scores);
 
-        // Debug scores after softmax for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_scores_after_softmax", block_idx);
-            REGISTER_DEBUG(debug_name, scores);
-        }
+        // v = ggml_permute(ctx0, v, 1, 0, 2, 3); 
+        // v = ggml_cont(ctx0, v);
 
-        // Step 3: Broadcast V to all heads by matching k_broadcast's dimension order
-        // First permute V from [M, D, 1, B] to [D, M, 1, B] to match k_broadcast
-        v = ggml_permute(ctx0, v, 1, 0, 2, 3); // [D, M, 1, B]
-        v = ggml_cont(ctx0, v);
+        // Step 3: Compute Attn @ V
+        // V:      [M, D, 1, B] (ne0=M, ne1=D)
+        // Scores: [M, N, n_head, B] (ne0=M, ne1=N)
+        //
+        // ggml_mul_mat computes V^T * Scores -> [M, D]^T * [M, N] -> [D, M] * [M, N] -> [D, N]
+        // Implicit Broadcast: V has 1 head, Scores has n_head. ggml handles this automatically.
+        
+        // FIX: Removed v_broadcast and ggml_repeat logic. Using implicit broadcast.
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, scores); // Result: [N, D, n_head, B]
 
-        // Step 4: Broadcast V over heads: [D, M, 1, B] -> [D, M, n_head, B]
-        // Now dimensions match k_broadcast [D, M, n_head, B] except for dim 2
-        ggml_tensor * v_broadcast = ggml_repeat(ctx0, v, k_broadcast);
-
-        // Step 5: Permute V back to [M, D, n_head, B] for multiplication
-        v_broadcast = ggml_permute(ctx0, v_broadcast, 1, 0, 2, 3); // [M, D, n_head, B]
-        v_broadcast = ggml_cont(ctx0, v_broadcast);
-
-        // Debug v_broadcast for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_v_broadcast", block_idx);
-            REGISTER_DEBUG(debug_name, v_broadcast);
-        }
-
-        // Step 6: Compute attn @ V -> output
-        // scores: [M, N, n_head, B], v_broadcast: [M, D, n_head, B]
-        // Result: [D, N, n_head, B]
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_broadcast, scores);
-
-        // Debug kqv before projection for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_kqv_before_projection", block_idx);
-            REGISTER_DEBUG(debug_name, kqv);
+        // Debug kqv
+        if (block_idx == 33) {
+             char debug_name[128];
+             snprintf(debug_name, sizeof(debug_name), "block%d_kqv_out", block_idx);
+             REGISTER_DEBUG(debug_name, kqv);
         }
 
         // --- Reshape back to spatial layout ---
-        // kqv is already [D, N, n_head, B], reshape to [N, D, n_head, B] then to spatial
-        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3);            // [N, D, n_head, B]
+        // kqv is [N, D, n_head, B]. We want [D, N, n_head, B] to merge heads.
+        kqv = ggml_permute(ctx0, kqv, 1, 0, 2, 3); // [D, N, n_head, B]
         kqv = ggml_cont(ctx0, kqv);
-        kqv = ggml_reshape_3d(ctx0, kqv, N, D * n_head, B);  // [N, D*n_head, B]
-        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D * n_head, B); // [W, H, D*n_head, B]
+        
+        // Reshape to [N, D*n_head, B] then [W, H, C, B]
+        kqv = ggml_reshape_3d(ctx0, kqv, N, D * n_head, B);
+        kqv = ggml_reshape_4d(ctx0, kqv, W, H, D * n_head, B);
         kqv = ggml_cont(ctx0, kqv);
 
         // Output projection
         cur = ggml_conv_2d(ctx0, block.attn_o_w, kqv, 1, 1, 0, 0, 1, 1);
 
-        // Debug after output projection for blocks 33, 50 and 52
-        if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_after_output_projection", block_idx);
-            REGISTER_DEBUG(debug_name, cur);
-        }
-
-        // Apply layer_scale and residual connection
+        // Residual & Layer Scale
         if (inp->ne[0] == cur->ne[0] && inp->ne[2] == cur->ne[2]) {
             if (block.layer_scale_w) {
                 ggml_tensor * scaled = ggml_permute(ctx0, cur, 2, 0, 1, 3);
-                scaled = ggml_cont(ctx0, scaled);  // Make contiguous before mul
+                scaled = ggml_cont(ctx0, scaled);
                 ggml_tensor * scale_w_reshaped = ggml_reshape_4d(ctx0, block.layer_scale_w,
                     1, block.layer_scale_w->ne[0], 1, 1);
                 scaled = ggml_mul(ctx0, scaled, scale_w_reshaped);
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
                 cur = ggml_cont(ctx0, cur);
-
-                // Debug after layer_scale for blocks 33, 50 and 52
-                if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-                    char debug_name[128];
-                    snprintf(debug_name, sizeof(debug_name), "block%d_after_layer_scale", block_idx);
-                    REGISTER_DEBUG(debug_name, cur);
-                }
             }
             cur = ggml_add(ctx0, cur, inp);
-
-            // Debug final output for blocks 33, 50 and 52
-            if (block_idx == 33 || block_idx == 50 || block_idx == 52) {
-                char debug_name[128];
-                snprintf(debug_name, sizeof(debug_name), "block%d_final_output", block_idx);
-                REGISTER_DEBUG(debug_name, cur);
-            }
         }
 
         return cur;
@@ -5203,7 +5071,7 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 // Resize to 768x768 using bilinear interpolation, then rescale to f32
                 clip_image_u8 resized_image;
                 int sz = params.image_size;
-                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BILINEAR, false);
+                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BICUBIC, false);
                 clip_image_f32_ptr img_f32(clip_image_f32_init());
                 rescale_image_u8_to_f32(resized_image, *img_f32);
                 res_imgs->entries.push_back(std::move(img_f32));
