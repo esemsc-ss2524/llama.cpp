@@ -5380,11 +5380,17 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         const char* save_tensors_env = getenv("CLIP_DEBUG_SAVE_TENSORS");
         if (save_tensors_env && atoi(save_tensors_env) == 1) {
             ggml_tensor* inp_raw_tensor = get_inp_tensor("inp_raw");
+            LOG_INF("*** DEBUG inp_raw IMMEDIATELY after set_input_f32 ***\n");
+            LOG_INF("  Tensor dims: [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    inp_raw_tensor->ne[0], inp_raw_tensor->ne[1], inp_raw_tensor->ne[2], inp_raw_tensor->ne[3]);
+            LOG_INF("  Vector size: %zu\n", inp_raw.size());
+
             std::vector<float> test_read(100);  // Read first 100 values
             ggml_backend_tensor_get(inp_raw_tensor, test_read.data(), 0, 100 * sizeof(float));
-            LOG_INF("DEBUG: First 10 values of inp_raw after set_input_f32:\n");
+            LOG_INF("  First 10 values after set_input_f32:\n");
             for (int i = 0; i < 10; i++) {
-                LOG_INF("  [%d] = %.6f (expected: %.6f)\n", i, test_read[i], inp_raw[i]);
+                LOG_INF("    [%d] read=%.6f expected=%.6f %s\n", i, test_read[i], inp_raw[i],
+                        (test_read[i] == inp_raw[i]) ? "✓" : "✗");
             }
         }
 
@@ -5719,6 +5725,33 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
             // Save to captured_tensors for later writing
             captured_tensors.push_back(std::make_tuple(name, data_f32, shape));
+
+            // Debug: Print detailed info for inp_raw_from_graph
+            if (name == "inp_raw_from_graph") {
+                LOG_INF("  *** DEBUG inp_raw_from_graph ***\n");
+                LOG_INF("    Tensor dims: [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+                LOG_INF("    Saved shape: [");
+                for (size_t i = 0; i < shape.size(); i++) {
+                    LOG_INF("%" PRId64, shape[i]);
+                    if (i < shape.size() - 1) LOG_INF(", ");
+                }
+                LOG_INF("]\n");
+                LOG_INF("    Total elements: %zu\n", data_f32.size());
+                LOG_INF("    First 10 values: ");
+                for (int i = 0; i < 10 && i < (int)data_f32.size(); i++) {
+                    LOG_INF("%.6f ", data_f32[i]);
+                }
+                LOG_INF("\n");
+                // Find min/max
+                float min_val = data_f32[0], max_val = data_f32[0];
+                for (const auto& v : data_f32) {
+                    if (v < min_val) min_val = v;
+                    if (v > max_val) max_val = v;
+                }
+                LOG_INF("    Value range: [%.6f, %.6f]\n", min_val, max_val);
+            }
+
             LOG_INF("  Captured tensor '%s' (%zu elements, type=%s)\n",
                     name.c_str(), data_f32.size(), ggml_type_name(tensor->type));
         }
