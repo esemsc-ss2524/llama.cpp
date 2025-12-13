@@ -598,7 +598,7 @@ struct clip_graph {
 
     // Helper: Normalize over the Channel dimension (dim 2 in [W, H, C, B])
     // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
-    ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f) {
+    ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f, int debug_block_idx = -1) {
         // inp: [W, H, C, B]
         const int64_t W = inp->ne[0];
         const int64_t H = inp->ne[1];
@@ -615,14 +615,35 @@ struct clip_graph {
         // Reshape to [C, W*H*B] for RMS norm
         cur = ggml_reshape_2d(ctx0, cur, C, W * H * B);
 
+        // Debug before rms_norm for blocks 50 and 52
+        if (debug_block_idx == 50 || debug_block_idx == 52) {
+            char debug_name[128];
+            snprintf(debug_name, sizeof(debug_name), "block%d_before_rms_norm", debug_block_idx);
+            REGISTER_DEBUG(debug_name, cur);
+        }
+
         // Apply RMS Norm (normalizes first dimension C)
         cur = ggml_rms_norm(ctx0, cur, eps);
+
+        // Debug after rms_norm for blocks 50 and 52
+        if (debug_block_idx == 50 || debug_block_idx == 52) {
+            char debug_name[128];
+            snprintf(debug_name, sizeof(debug_name), "block%d_after_rms_norm", debug_block_idx);
+            REGISTER_DEBUG(debug_name, cur);
+        }
 
         // Apply weight (Scale)
         if (weight) {
             // weight is [C], cur is [C, W*H*B]
             // ggml_mul will broadcast along the second dimension
             cur = ggml_mul(ctx0, cur, weight);
+
+            // Debug after weight multiplication for blocks 50 and 52
+            if (debug_block_idx == 50 || debug_block_idx == 52) {
+                char debug_name[128];
+                snprintf(debug_name, sizeof(debug_name), "block%d_after_norm_weight_mul", debug_block_idx);
+                REGISTER_DEBUG(debug_name, cur);
+            }
         }
 
         // Reshape back to [C, W*H, B]
@@ -751,7 +772,14 @@ struct clip_graph {
         ggml_tensor * cur = inp;
 
         if (block.attn_norm_w) {
-            cur = rms_norm_2d(cur, block.attn_norm_w);
+            // Debug the norm weight for blocks 50 and 52
+            if (block_idx == 50 || block_idx == 52) {
+                char debug_name[128];
+                snprintf(debug_name, sizeof(debug_name), "block%d_attn_norm_weight", block_idx);
+                REGISTER_DEBUG(debug_name, block.attn_norm_w);
+            }
+
+            cur = rms_norm_2d(cur, block.attn_norm_w, 1e-6f, block_idx);
         }
 
         // Debug after norm for blocks 50 and 52
@@ -777,7 +805,7 @@ struct clip_graph {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_k_norm_w) {
-                k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w);
+                k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w, 1e-6f, block_idx);
             }
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
@@ -795,7 +823,7 @@ struct clip_graph {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
             if (block.attn_v_norm_w) {
-                v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w);
+                v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w, 1e-6f, block_idx);
             }
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
