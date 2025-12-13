@@ -5693,29 +5693,36 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             int64_t nelements = ggml_nelements(tensor);
             size_t nbytes = ggml_nbytes(tensor);
 
-            std::vector<uint8_t> data(nbytes);
-            ggml_backend_tensor_get(tensor, data.data(), 0, nbytes);
-
-            // Convert to float32 immediately
-            std::vector<float> data_f32(nelements);
-            for (int64_t i = 0; i < nelements; i++) {
-                if (tensor->type == GGML_TYPE_F32) {
-                    data_f32[i] = ((float*)data.data())[i];
-                } else if (tensor->type == GGML_TYPE_F16) {
-                    data_f32[i] = ggml_fp16_to_fp32(((ggml_fp16_t*)data.data())[i]);
-                }
-            }
-
-            // Store shape
+            // Store shape first
             int ndims = ggml_n_dims(tensor);
             std::vector<int64_t> shape;
             for (int i = ndims - 1; i >= 0; i--) {  // Reverse for NumPy
                 shape.push_back(tensor->ne[i]);
             }
 
+            // Read directly into float vector (matching working debug code pattern)
+            std::vector<float> data_f32(nelements);
+
+            if (tensor->type == GGML_TYPE_F32) {
+                // Read directly into float vector (same as working debug code at line 5382)
+                ggml_backend_tensor_get(tensor, data_f32.data(), 0, nbytes);
+            } else if (tensor->type == GGML_TYPE_F16) {
+                // For F16, we need to convert
+                std::vector<ggml_fp16_t> data_f16(nelements);
+                ggml_backend_tensor_get(tensor, data_f16.data(), 0, nbytes);
+                for (int64_t i = 0; i < nelements; i++) {
+                    data_f32[i] = ggml_fp16_to_fp32(data_f16[i]);
+                }
+            } else {
+                LOG_WRN("Warning: Unsupported tensor type %s for '%s', skipping\n",
+                        ggml_type_name(tensor->type), name.c_str());
+                continue;
+            }
+
             // Save to captured_tensors for later writing
             captured_tensors.push_back(std::make_tuple(name, data_f32, shape));
-            LOG_INF("  Captured tensor '%s' (%zu elements)\n", name.c_str(), data_f32.size());
+            LOG_INF("  Captured tensor '%s' (%zu elements, type=%s)\n",
+                    name.c_str(), data_f32.size(), ggml_type_name(tensor->type));
         }
 
         LOG_INF("=== Captured %zu tensors ===\n\n", captured_tensors.size());
