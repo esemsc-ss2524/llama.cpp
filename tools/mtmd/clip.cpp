@@ -597,100 +597,41 @@ struct clip_graph {
     }
 
     // Helper: Normalize over the Channel dimension (dim 2 in [W, H, C, B])
-    // ggml_rms_norm normalizes dim 0. We must permute C to dim 0.
+    // RMS Norm 2D - normalizes over channels for each spatial position
+    // PyTorch: x.mean(dim=1) computes mean over C channels for each (N,H,W)
+    // ggml_rms_norm normalizes each ROW over its COLUMNS
+    // So we need shape [W*H*B, C] where each row is one spatial position
     ggml_tensor * rms_norm_2d(ggml_tensor * inp, ggml_tensor * weight, float eps = 1e-6f, int debug_block_idx = -1) {
-
-                // Debug helper
-        auto DEBUG_SHAPE = [&](const char* label, ggml_tensor* t) {
-            if (!t) {
-                fprintf(stderr, "DEBUG: %s is NULL\n", label);
-                return;
-            }
-            fprintf(stderr, "DEBUG: %-25s | Type: %s | Shape: [%ld, %ld, %ld, %ld]\n",
-                label, ggml_type_name(t->type),
-                t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-        };
-
-        // Helper to register tensor for debugging
-        // CRITICAL: Follow ggml_easy::debug_print pattern EXACTLY
-        auto REGISTER_DEBUG = [&](const std::string& name, ggml_tensor* t) {
-            // If tensor has flags (input/output/etc), we need to COPY it first
-            // This is what ggml_easy does to prevent corrupting the graph
-            if (t->flags) {
-                // Create a copy: ggml_cpy(gf_ctx, t, ggml_dup_tensor(gf_ctx, t))
-                t = ggml_cpy(ctx0, t, ggml_dup_tensor(ctx0, t));
-            }
-
-            // Set the name
-            ggml_set_name(t, name.c_str());
-
-            // Mark as output - tells scheduler to preserve this tensor's data
-            ggml_set_output(t);
-
-            // CRITICAL: Add to graph with ggml_build_forward_expand
-            // This is what ggml_easy::mark_output does!
-            ggml_build_forward_expand(gf, t);
-
-            // Store the tensor pointer - we'll read its data after computation
-            ctx->debug_intermediate_tensors.push_back({name, t});
-        };
-
-
-        // inp: [W, H, C, B]
+        // inp: [W, H, C, B] in ggml format
         const int64_t W = inp->ne[0];
         const int64_t H = inp->ne[1];
         const int64_t C = inp->ne[2];
         const int64_t B = inp->ne[3];
 
-        // Flatten spatial dimensions: [W, H, C, B] -> [W*H, C, B]
-        ggml_tensor * cur = ggml_reshape_3d(ctx0, inp, W * H, C, B);
+        // Step 1: Reshape from [W, H, C, B] to [C, W*H*B]
+        ggml_tensor * cur = ggml_reshape_2d(ctx0, inp, C, W * H * B);
 
-        // Permute to [C, W*H, B]
+        // Step 2: Transpose to [W*H*B, C]
+        // This makes each row a spatial position, each column a channel
         cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
         cur = ggml_cont(ctx0, cur);
 
-        // Reshape to [C, W*H*B] for RMS norm
-        cur = ggml_reshape_2d(ctx0, cur, C, W * H * B);
-
-        // Debug before rms_norm for blocks 33, 50 and 52
-        if (debug_block_idx == 33 || debug_block_idx == 50 || debug_block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_before_rms_norm", debug_block_idx);
-            REGISTER_DEBUG(debug_name, cur);
-        }
-
-        // Apply RMS Norm (normalizes first dimension C)
+        // Step 3: Apply RMS norm
+        // Normalizes each row (spatial position) over columns (channels)
         cur = ggml_rms_norm(ctx0, cur, eps);
 
-        // Debug after rms_norm for blocks 33, 50 and 52
-        if (debug_block_idx == 33 || debug_block_idx == 50 || debug_block_idx == 52) {
-            char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block%d_after_rms_norm", debug_block_idx);
-            REGISTER_DEBUG(debug_name, cur);
-        }
-
-        // Apply weight (Scale)
+        // Step 4: Apply weight scaling if present
         if (weight) {
-            // weight is [C], cur is [C, W*H*B]
-            // ggml_mul will broadcast along the second dimension
+            // weight is [C], cur is [W*H*B, C]
+            // ggml_mul broadcasts weight across rows
             cur = ggml_mul(ctx0, cur, weight);
-
-            // Debug after weight multiplication for blocks 33, 50 and 52
-            if (debug_block_idx == 33 || debug_block_idx == 50 || debug_block_idx == 52) {
-                char debug_name[128];
-                snprintf(debug_name, sizeof(debug_name), "block%d_after_norm_weight_mul", debug_block_idx);
-                REGISTER_DEBUG(debug_name, cur);
-            }
         }
 
-        // Reshape back to [C, W*H, B]
-        cur = ggml_reshape_3d(ctx0, cur, C, W * H, B);
-
-        // Permute to [W*H, C, B]
+        // Step 5: Transpose back to [C, W*H*B]
         cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
         cur = ggml_cont(ctx0, cur);
 
-        // Reshape to [W, H, C, B]
+        // Step 6: Reshape back to original [W, H, C, B]
         cur = ggml_reshape_4d(ctx0, cur, W, H, C, B);
 
         return cur;
