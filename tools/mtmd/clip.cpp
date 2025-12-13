@@ -781,6 +781,18 @@ struct clip_graph {
         const int n_head = q->ne[2] / D;
         const int N = W * H; // Number of query positions
 
+        // Debug for problematic blocks
+        if (block_idx >= 50 && block_idx <= 54) {
+            fprintf(stderr, "  ATTN Block %d: W=%d, H=%d, D=%d, n_head=%d, N=%d\n",
+                    block_idx, W, H, D, n_head, N);
+            fprintf(stderr, "  Q shape: [%ld, %ld, %ld, %ld]\n",
+                    q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
+            fprintf(stderr, "  K shape: [%ld, %ld, %ld, %ld]\n",
+                    k->ne[0], k->ne[1], k->ne[2], k->ne[3]);
+            fprintf(stderr, "  V shape: [%ld, %ld, %ld, %ld]\n",
+                    v->ne[0], v->ne[1], v->ne[2], v->ne[3]);
+        }
+
         // Process Q: [W, H, D*n_head, B] -> [D, N, n_head, B]
         q = ggml_reshape_3d(ctx0, q, W*H, D*n_head, B);        // [N, D*n_head, B]
         q = ggml_reshape_4d(ctx0, q, W*H, D, n_head, B);       // [N, D, n_head, B]
@@ -953,6 +965,16 @@ struct clip_graph {
         for (int i = 0; i < total_blocks; i++) {
             const auto & block = model.mobilenet_blocks[i];
             int stride = is_stage_start(i) ? 2 : 1;
+
+            // Debug block type
+            const char* block_type = block.s0_conv_exp_w ? "edge_residual" :
+                                      block.attn_q_w ? "attention" : "inverted_residual";
+
+            // Debug input for problematic blocks
+            if (i >= 50 && i <= 54) {
+                fprintf(stderr, "DEBUG: Block %d (%s) input shape: [%ld, %ld, %ld, %ld], stride=%d\n",
+                        i, block_type, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3], stride);
+            }
 
             if (block.s0_conv_exp_w)      cur = build_edge_residual(cur, block, stride, i);
             else if (block.attn_q_w)      cur = build_mobilenet_attn(cur, block, i);
