@@ -803,10 +803,30 @@ struct clip_graph {
         ggml_tensor * k_inp = cur;
         if (block.attn_k_dw_w) {
             int stride = 2; int pad = block.attn_k_dw_w->ne[0] / 2;
+
+            // Debug for block 33
+            if (block_idx == 33) {
+                fprintf(stderr, "  Block 33: K downsampling DW weight exists, kernel=%ld, applying stride=%d\n",
+                        block.attn_k_dw_w->ne[0], stride);
+                fprintf(stderr, "  K input shape before DW: [%ld, %ld, %ld, %ld]\n",
+                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+            }
+
             k_inp = ggml_conv_2d_dw(ctx0, block.attn_k_dw_w, cur, stride, stride, pad, pad, 1, 1);
+
+            // Debug after downsampling
+            if (block_idx == 33) {
+                fprintf(stderr, "  K input shape after DW: [%ld, %ld, %ld, %ld]\n",
+                        k_inp->ne[0], k_inp->ne[1], k_inp->ne[2], k_inp->ne[3]);
+            }
+
             if (block.attn_k_norm_w) {
                 k_inp = rms_norm_2d(k_inp, block.attn_k_norm_w, 1e-6f, block_idx);
             }
+        } else if (block_idx == 33) {
+            fprintf(stderr, "  Block 33 WARNING: K downsampling DW weight is NULL - K will NOT be downsampled!\n");
+            fprintf(stderr, "  K input shape (no downsampling): [%ld, %ld, %ld, %ld]\n",
+                    cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
@@ -821,10 +841,30 @@ struct clip_graph {
         ggml_tensor * v_inp = cur;
         if (block.attn_v_dw_w) {
             int stride = 2; int pad = block.attn_v_dw_w->ne[0] / 2;
+
+            // Debug for block 33
+            if (block_idx == 33) {
+                fprintf(stderr, "  Block 33: V downsampling DW weight exists, kernel=%ld, applying stride=%d\n",
+                        block.attn_v_dw_w->ne[0], stride);
+                fprintf(stderr, "  V input shape before DW: [%ld, %ld, %ld, %ld]\n",
+                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+            }
+
             v_inp = ggml_conv_2d_dw(ctx0, block.attn_v_dw_w, cur, stride, stride, pad, pad, 1, 1);
+
+            // Debug after downsampling
+            if (block_idx == 33) {
+                fprintf(stderr, "  V input shape after DW: [%ld, %ld, %ld, %ld]\n",
+                        v_inp->ne[0], v_inp->ne[1], v_inp->ne[2], v_inp->ne[3]);
+            }
+
             if (block.attn_v_norm_w) {
                 v_inp = rms_norm_2d(v_inp, block.attn_v_norm_w, 1e-6f, block_idx);
             }
+        } else if (block_idx == 33) {
+            fprintf(stderr, "  Block 33 WARNING: V downsampling DW weight is NULL - V will NOT be downsampled!\n");
+            fprintf(stderr, "  V input shape (no downsampling): [%ld, %ld, %ld, %ld]\n",
+                    cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
@@ -845,15 +885,19 @@ struct clip_graph {
         const int N = W * H; // Number of query positions
 
         // Debug for problematic blocks
-        if (block_idx >= 50 && block_idx <= 54) {
+        if (block_idx == 33 || (block_idx >= 50 && block_idx <= 54)) {
+            const int Wk = k->ne[0]; const int Hk = k->ne[1];
+            const int M = Wk * Hk;
             fprintf(stderr, "  ATTN Block %d: W=%d, H=%d, D=%d, n_head=%d, N=%d\n",
                     block_idx, W, H, D, n_head, N);
             fprintf(stderr, "  Q shape: [%ld, %ld, %ld, %ld]\n",
                     q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
-            fprintf(stderr, "  K shape: [%ld, %ld, %ld, %ld]\n",
-                    k->ne[0], k->ne[1], k->ne[2], k->ne[3]);
+            fprintf(stderr, "  K shape: [%ld, %ld, %ld, %ld], Wk=%d, Hk=%d, M=%d\n",
+                    k->ne[0], k->ne[1], k->ne[2], k->ne[3], Wk, Hk, M);
             fprintf(stderr, "  V shape: [%ld, %ld, %ld, %ld]\n",
                     v->ne[0], v->ne[1], v->ne[2], v->ne[3]);
+            fprintf(stderr, "  Expected attention scores shape: [%d, %d, %d] (N x M x n_head)\n",
+                    N, M, n_head);
         }
 
         // Process Q: [W, H, D*n_head, B] -> [D, N, n_head, B]
