@@ -742,10 +742,11 @@ struct clip_graph {
         ggml_tensor * cur = inp;
 
         // 1. Depthwise Start (Optional)
+        // NOTE: dw_start always has stride=1 (no downsampling here)
         if (block.dw_start_w) {
             int k = block.dw_start_w->ne[0]; // 3 or 5
             int p = k / 2;
-            cur = ggml_conv_2d_dw(ctx0, block.dw_start_w, cur, stride, stride, p, p, 1, 1);
+            cur = ggml_conv_2d_dw(ctx0, block.dw_start_w, cur, 1, 1, p, p, 1, 1);
             if (block.dw_start_bn_w) cur = rms_norm_2d(cur, block.dw_start_bn_w);
         }
 
@@ -758,10 +759,11 @@ struct clip_graph {
         }
 
         // 3. Depthwise Mid (Optional)
+        // NOTE: dw_mid is where downsampling happens (stride=2 for first block of stage)
         if (block.dw_mid_w) {
             int k = block.dw_mid_w->ne[0]; // 3 or 5
             int p = k / 2;
-            cur = ggml_conv_2d_dw(ctx0, block.dw_mid_w, cur, 1, 1, p, p, 1, 1);
+            cur = ggml_conv_2d_dw(ctx0, block.dw_mid_w, cur, stride, stride, p, p, 1, 1);
             if (block.dw_mid_bn_w) cur = rms_norm_2d(cur, block.dw_mid_bn_w);
             cur = ggml_gelu(ctx0, cur);
         }
