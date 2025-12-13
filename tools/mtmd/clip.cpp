@@ -741,10 +741,10 @@ struct clip_graph {
     // MobileNet Multi-Query Attention (MQA) - Corrected
     // ------------------------------------------------------------------------
     ggml_tensor * build_mobilenet_attn(ggml_tensor * inp, const mobilenetv5_block & block, int block_idx = -1) {
-        // Debug input to block 52
-        if (block_idx == 52) {
+        // Debug input to blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_input");
+            snprintf(debug_name, sizeof(debug_name), "block%d_input", block_idx);
             REGISTER_DEBUG(debug_name, inp);
         }
 
@@ -754,20 +754,20 @@ struct clip_graph {
             cur = rms_norm_2d(cur, block.attn_norm_w);
         }
 
-        // Debug after norm for block 52
-        if (block_idx == 52 && block.attn_norm_w) {
+        // Debug after norm for blocks 50 and 52
+        if ((block_idx == 50 || block_idx == 52) && block.attn_norm_w) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_after_norm");
+            snprintf(debug_name, sizeof(debug_name), "block%d_after_norm", block_idx);
             REGISTER_DEBUG(debug_name, cur);
         }
 
         // 1. Q Calculation: [W, H, C, B] -> [W, H, D*n_head, B]
         ggml_tensor * q = ggml_conv_2d(ctx0, block.attn_q_w, cur, 1, 1, 0, 0, 1, 1);
 
-        // Debug Q after conv for block 52
-        if (block_idx == 52) {
+        // Debug Q after conv for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_q_after_conv");
+            snprintf(debug_name, sizeof(debug_name), "block%d_q_after_conv", block_idx);
             REGISTER_DEBUG(debug_name, q);
         }
 
@@ -782,10 +782,10 @@ struct clip_graph {
         }
         ggml_tensor * k = ggml_conv_2d(ctx0, block.attn_k_w, k_inp, 1, 1, 0, 0, 1, 1);
 
-        // Debug K after conv for block 52
-        if (block_idx == 52) {
+        // Debug K after conv for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_k_after_conv");
+            snprintf(debug_name, sizeof(debug_name), "block%d_k_after_conv", block_idx);
             REGISTER_DEBUG(debug_name, k);
         }
 
@@ -800,10 +800,10 @@ struct clip_graph {
         }
         ggml_tensor * v = ggml_conv_2d(ctx0, block.attn_v_w, v_inp, 1, 1, 0, 0, 1, 1);
 
-        // Debug V after conv for block 52
-        if (block_idx == 52) {
+        // Debug V after conv for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_v_after_conv");
+            snprintf(debug_name, sizeof(debug_name), "block%d_v_after_conv", block_idx);
             REGISTER_DEBUG(debug_name, v);
         }
 
@@ -855,37 +855,43 @@ struct clip_graph {
 
         float scale = 1.0f / sqrtf((float)D);
 
-        // Debug intermediate tensors for block 52
-        if (block_idx == 52) {
-            fprintf(stderr, "  DEBUG Block 52: scale = %f (1/sqrt(%d))\n", scale, D);
+        // Debug intermediate tensors for blocks 50 and 52 (for comparison)
+        if (block_idx == 50 || block_idx == 52) {
+            fprintf(stderr, "  DEBUG Block %d: scale = %f (1/sqrt(%d))\n", block_idx, scale, D);
 
             // Check the weights themselves
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_attn_q_weight");
+            snprintf(debug_name, sizeof(debug_name), "block%d_attn_q_weight", block_idx);
             REGISTER_DEBUG(debug_name, block.attn_q_w);
-            snprintf(debug_name, sizeof(debug_name), "block52_attn_k_weight");
+            snprintf(debug_name, sizeof(debug_name), "block%d_attn_k_weight", block_idx);
             REGISTER_DEBUG(debug_name, block.attn_k_w);
-            snprintf(debug_name, sizeof(debug_name), "block52_attn_v_weight");
+            snprintf(debug_name, sizeof(debug_name), "block%d_attn_v_weight", block_idx);
             REGISTER_DEBUG(debug_name, block.attn_v_w);
-            snprintf(debug_name, sizeof(debug_name), "block52_attn_o_weight");
+            snprintf(debug_name, sizeof(debug_name), "block%d_attn_o_weight", block_idx);
             REGISTER_DEBUG(debug_name, block.attn_o_w);
 
+            // Also debug layer_scale weight if present
+            if (block.layer_scale_w) {
+                snprintf(debug_name, sizeof(debug_name), "block%d_layer_scale_weight", block_idx);
+                REGISTER_DEBUG(debug_name, block.layer_scale_w);
+            }
+
             // Capture processed Q, K, V
-            snprintf(debug_name, sizeof(debug_name), "block52_q_processed");
+            snprintf(debug_name, sizeof(debug_name), "block%d_q_processed", block_idx);
             REGISTER_DEBUG(debug_name, q);
-            snprintf(debug_name, sizeof(debug_name), "block52_k_processed");
+            snprintf(debug_name, sizeof(debug_name), "block%d_k_processed", block_idx);
             REGISTER_DEBUG(debug_name, k);
-            snprintf(debug_name, sizeof(debug_name), "block52_v_processed");
+            snprintf(debug_name, sizeof(debug_name), "block%d_v_processed", block_idx);
             REGISTER_DEBUG(debug_name, v);
         }
 
         // Step 1: Broadcast K to all heads: [D, M, 1, B] -> [D, M, n_head, B]
         ggml_tensor * k_broadcast = ggml_repeat(ctx0, k, q);
 
-        // Debug k_broadcast for block 52
-        if (block_idx == 52) {
+        // Debug k_broadcast for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_k_broadcast");
+            snprintf(debug_name, sizeof(debug_name), "block%d_k_broadcast", block_idx);
             REGISTER_DEBUG(debug_name, k_broadcast);
         }
 
@@ -894,28 +900,28 @@ struct clip_graph {
         // Result: [N, M, n_head, B]
         ggml_tensor * scores = ggml_mul_mat(ctx0, k_broadcast, q);
 
-        // Debug scores before scaling for block 52
-        if (block_idx == 52) {
+        // Debug scores before scaling for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_scores_before_scale");
+            snprintf(debug_name, sizeof(debug_name), "block%d_scores_before_scale", block_idx);
             REGISTER_DEBUG(debug_name, scores);
         }
 
         scores = ggml_scale(ctx0, scores, scale);
 
-        // Debug scores after scaling for block 52
-        if (block_idx == 52) {
+        // Debug scores after scaling for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_scores_after_scale");
+            snprintf(debug_name, sizeof(debug_name), "block%d_scores_after_scale", block_idx);
             REGISTER_DEBUG(debug_name, scores);
         }
 
         scores = ggml_soft_max(ctx0, scores);
 
-        // Debug scores after softmax for block 52
-        if (block_idx == 52) {
+        // Debug scores after softmax for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_scores_after_softmax");
+            snprintf(debug_name, sizeof(debug_name), "block%d_scores_after_softmax", block_idx);
             REGISTER_DEBUG(debug_name, scores);
         }
 
@@ -932,10 +938,10 @@ struct clip_graph {
         v_broadcast = ggml_permute(ctx0, v_broadcast, 1, 0, 2, 3); // [M, D, n_head, B]
         v_broadcast = ggml_cont(ctx0, v_broadcast);
 
-        // Debug v_broadcast for block 52
-        if (block_idx == 52) {
+        // Debug v_broadcast for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_v_broadcast");
+            snprintf(debug_name, sizeof(debug_name), "block%d_v_broadcast", block_idx);
             REGISTER_DEBUG(debug_name, v_broadcast);
         }
 
@@ -944,10 +950,10 @@ struct clip_graph {
         // Result: [D, N, n_head, B]
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v_broadcast, scores);
 
-        // Debug kqv before projection for block 52
-        if (block_idx == 52) {
+        // Debug kqv before projection for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_kqv_before_projection");
+            snprintf(debug_name, sizeof(debug_name), "block%d_kqv_before_projection", block_idx);
             REGISTER_DEBUG(debug_name, kqv);
         }
 
@@ -962,10 +968,10 @@ struct clip_graph {
         // Output projection
         cur = ggml_conv_2d(ctx0, block.attn_o_w, kqv, 1, 1, 0, 0, 1, 1);
 
-        // Debug after output projection for block 52
-        if (block_idx == 52) {
+        // Debug after output projection for blocks 50 and 52
+        if (block_idx == 50 || block_idx == 52) {
             char debug_name[128];
-            snprintf(debug_name, sizeof(debug_name), "block52_after_output_projection");
+            snprintf(debug_name, sizeof(debug_name), "block%d_after_output_projection", block_idx);
             REGISTER_DEBUG(debug_name, cur);
         }
 
@@ -980,19 +986,19 @@ struct clip_graph {
                 cur = ggml_permute(ctx0, scaled, 1, 2, 0, 3);
                 cur = ggml_cont(ctx0, cur);
 
-                // Debug after layer_scale for block 52
-                if (block_idx == 52) {
+                // Debug after layer_scale for blocks 50 and 52
+                if (block_idx == 50 || block_idx == 52) {
                     char debug_name[128];
-                    snprintf(debug_name, sizeof(debug_name), "block52_after_layer_scale");
+                    snprintf(debug_name, sizeof(debug_name), "block%d_after_layer_scale", block_idx);
                     REGISTER_DEBUG(debug_name, cur);
                 }
             }
             cur = ggml_add(ctx0, cur, inp);
 
-            // Debug final output for block 52
-            if (block_idx == 52) {
+            // Debug final output for blocks 50 and 52
+            if (block_idx == 50 || block_idx == 52) {
                 char debug_name[128];
-                snprintf(debug_name, sizeof(debug_name), "block52_final_output");
+                snprintf(debug_name, sizeof(debug_name), "block%d_final_output", block_idx);
                 REGISTER_DEBUG(debug_name, cur);
             }
         }
